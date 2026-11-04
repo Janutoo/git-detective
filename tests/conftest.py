@@ -36,6 +36,7 @@ def make_commit(repo: Repo) -> Callable[..., str]:
         files: FileSpec,
         message: str = "Update files",
         author: Actor = DEFAULT_AUTHOR,
+        timestamp: int | None = None,
     ) -> str:
         nonlocal counter
         root = Path(repo.working_tree_dir)
@@ -51,9 +52,12 @@ def make_commit(repo: Repo) -> Callable[..., str]:
                 target.write_text(content, encoding="utf-8")
             repo.index.add([rel_path])
 
-        # Distinct, increasing dates keep commit order deterministic.
+        # Distinct, increasing dates keep commit order deterministic unless the
+        # test pins an explicit timestamp.
         # Git's raw date format: "<unix timestamp> <utc offset>".
-        date = f"{BASE_TIMESTAMP + counter * 60} +0000"
+        if timestamp is None:
+            timestamp = BASE_TIMESTAMP + counter * 60
+        date = f"{timestamp} +0000"
         counter += 1
         commit = repo.index.commit(
             message,
