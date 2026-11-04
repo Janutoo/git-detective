@@ -128,6 +128,9 @@ def compute_hotspots(
             churn=s.churn,
             recent_commits=recent_count,
             score=_score(f, c, r, weights),
+            frequency_norm=f,
+            churn_norm=c,
+            recency_norm=r,
         )
         for s, recent_count, f, c, r in zip(
             stats, recent_counts, frequency_norm, churn_norm, recency_norm, strict=True

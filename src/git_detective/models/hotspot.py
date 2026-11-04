@@ -10,6 +10,9 @@ class Hotspot:
     ``score`` is a relative activity indicator in the range 0-100. It shows
     where change is concentrated in the analyzed history; it is *not* the
     probability that the file contains a bug.
+
+    The ``*_norm`` fields are the normalized (0-1) metrics the score was
+    computed from, kept so reports can explain each score.
     """
 
     path: str
@@ -17,3 +20,6 @@ class Hotspot:
     churn: int
     recent_commits: int
     score: float
+    frequency_norm: float
+    churn_norm: float
+    recency_norm: float

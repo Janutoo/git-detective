@@ -315,3 +315,36 @@ class TestDeterministicOrder:
         backward = compute_hotspots(commits[::-1], reference_time=REFERENCE)
 
         assert forward == backward
+
+
+class TestScoreComponents:
+    def test_components_explain_the_score(self) -> None:
+        commits = [
+            commit(OLD, ("a.py", 10, 0), ("b.py", 1, 0)),
+            commit(RECENT, ("a.py", 5, 5), ("c.png", 0, 0)),
+        ]
+        weights = HotspotWeights(frequency=0.5, churn=0.3, recency=0.2)
+
+        for h in compute_hotspots(commits, reference_time=REFERENCE, weights=weights):
+            for value in (h.frequency_norm, h.churn_norm, h.recency_norm):
+                assert 0.0 <= value <= 1.0
+            expected = 100 * (
+                0.5 * h.frequency_norm + 0.3 * h.churn_norm + 0.2 * h.recency_norm
+            )
+            assert h.score == pytest.approx(expected)
+
+    def test_components_for_known_values(self) -> None:
+        commits = [
+            commit(OLD, ("a.py", 10, 0), ("b.py", 1, 0)),
+            commit(RECENT, ("a.py", 5, 5)),
+        ]
+
+        ranked = {
+            h.path: h for h in compute_hotspots(commits, reference_time=REFERENCE)
+        }
+
+        a, b = ranked["a.py"], ranked["b.py"]
+        assert (a.frequency_norm, a.churn_norm, a.recency_norm) == (1.0, 1.0, 1.0)
+        assert b.frequency_norm == pytest.approx(math.log1p(1) / math.log1p(2))
+        assert b.churn_norm == pytest.approx(math.log1p(1) / math.log1p(20))
+        assert b.recency_norm == 0.0

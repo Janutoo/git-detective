@@ -15,3 +15,7 @@ class InvalidRepositoryError(GitDetectiveError):
 
 class GitReadError(GitDetectiveError):
     """Git failed while reading the repository history."""
+
+
+class IgnorePatternError(GitDetectiveError):
+    """An exclude pattern is invalid or the ignore file cannot be read."""
