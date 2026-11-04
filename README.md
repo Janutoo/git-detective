@@ -27,7 +27,7 @@ commits being merged.
 ## Installation
 
 ```bash
-git clone https://github.com/KamilJanusz/git-detective.git
+git clone https://github.com/Janutoo/git-detective.git
 cd git-detective
 python3.12 -m venv .venv
 source .venv/bin/activate
