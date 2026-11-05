@@ -9,11 +9,13 @@ import pytest
 
 from git_detective import __version__
 from git_detective.core.analyzer import aggregate_file_stats
+from git_detective.core.authors import compute_author_stats
 from git_detective.core.hotspots import compute_hotspots
 from git_detective.models import CommitInfo, FileChange
 from git_detective.reporting import (
     SCHEMA_VERSION,
     ReportContext,
+    build_authors_report,
     build_hotspots_report,
     build_scan_report,
     escape_markdown,
@@ -260,3 +262,147 @@ class TestEscapeMarkdown:
     )
     def test_escaping(self, raw: str, escaped: str) -> None:
         assert escape_markdown(raw) == escaped
+
+
+# --- Authors report ----------------------------------------------------------
+
+
+def authored(
+    name: str, email: str, when: datetime, *changes: tuple[str, int, int]
+) -> CommitInfo:
+    return CommitInfo(
+        hexsha="f" * 40,
+        author_name=name,
+        author_email=email,
+        authored_at=when,
+        message="msg",
+        files=tuple(FileChange(p, a, d) for p, a, d in changes),
+    )
+
+
+@pytest.fixture
+def team_commits() -> list[CommitInfo]:
+    return [
+        authored(
+            "Alice",
+            "alice@example.com",
+            datetime(2024, 5, 3, 10, 0, tzinfo=WARSAW),
+            ("src/app.py", 10, 2),
+            ("README.md", 1, 0),
+        ),
+        authored(
+            "Alice",
+            "alice@example.com",
+            datetime(2024, 6, 20, 9, 0, tzinfo=UTC),
+            ("src/app.py", 4, 4),
+        ),
+        authored(
+            "Bob | <script>",
+            "bob@example.com",
+            datetime(2024, 6, 1, 8, 0, tzinfo=UTC),
+            ("docs/guide.md", 30, 0),
+        ),
+    ]
+
+
+def authors_report(
+    commits: list[CommitInfo], *, top: int = 10, show_emails: bool = False
+) -> dict:
+    ctx = ReportContext(
+        repository=Path("/work/repo"),
+        generated_at=GENERATED,
+        commits=commits,
+        parameters={"limit": 500, "top": top, "show_emails": show_emails},
+    )
+    return build_authors_report(
+        compute_author_stats(commits), ctx, top=top, show_emails=show_emails
+    )
+
+
+class TestAuthorsReport:
+    def test_json_structure(self, team_commits: list[CommitInfo]) -> None:
+        data = json.loads(to_json(authors_report(team_commits)))
+
+        assert data["report"] == "authors"
+        assert list(data)[-1] == "authors"
+        assert data["summary"] == {
+            "commits_analyzed": 3,
+            "authors_total": 2,
+            "authors_reported": 2,
+            "period": {
+                "from": "2024-05-03T10:00:00+02:00",
+                "to": "2024-06-20T09:00:00+00:00",
+            },
+        }
+        alice = data["authors"][0]
+        assert alice == {
+            "rank": 1,
+            "name": "Alice",
+            "commits": 2,
+            "churn": 21,
+            "added": 15,
+            "deleted": 6,
+            "files_touched": 2,
+            "active_days": 2,
+            "first_commit": "2024-05-03T10:00:00+02:00",
+            "last_commit": "2024-06-20T09:00:00+00:00",
+            "top_files": [
+                {"path": "src/app.py", "commits": 2, "churn": 20},
+                {"path": "README.md", "commits": 1, "churn": 1},
+            ],
+            "activity_by_month": {"2024-05": 1, "2024-06": 1},
+        }
+
+    def test_emails_are_hidden_by_default(self, team_commits: list[CommitInfo]) -> None:
+        text = to_json(authors_report(team_commits))
+
+        assert "@example.com" not in text
+        assert all("emails" not in a for a in json.loads(text)["authors"])
+
+    def test_emails_can_be_included(self, team_commits: list[CommitInfo]) -> None:
+        data = json.loads(to_json(authors_report(team_commits, show_emails=True)))
+
+        assert data["authors"][0]["emails"] == ["alice@example.com"]
+        assert list(data["authors"][0])[:3] == ["rank", "name", "emails"]
+
+    def test_top_limits_authors(self, team_commits: list[CommitInfo]) -> None:
+        report = authors_report(team_commits, top=1)
+
+        assert [a["name"] for a in report["authors"]] == ["Alice"]
+        assert report["summary"]["authors_total"] == 2
+
+    def test_markdown(self, team_commits: list[CommitInfo]) -> None:
+        text = to_markdown(authors_report(team_commits))
+        lines = text.splitlines()
+
+        assert lines[0] == "# Git Detective — Contributors"
+        assert "- **Authors:** 2 (showing 2)" in lines
+        assert "Emails" not in text
+        assert "@example.com" not in text
+        assert (
+            "| 1 | Alice | 2 | 21 | 2 | 2 | 2024-05-03 | 2024-06-20 "
+            "| src/app.py, README.md | 2024-05: 1, 2024-06: 1 |"
+        ) in lines
+        assert "not productivity" in text
+
+    def test_markdown_escapes_author_names(
+        self, team_commits: list[CommitInfo]
+    ) -> None:
+        text = to_markdown(authors_report(team_commits))
+        row = next(line for line in text.splitlines() if "Bob" in line)
+
+        assert "Bob \\| \\<script\\>" in row
+        assert "<script>" not in text
+        assert len(re.findall(r"(?<!\\)\|", row)) == 11  # 10 columns
+
+    def test_markdown_with_emails(self, team_commits: list[CommitInfo]) -> None:
+        text = to_markdown(authors_report(team_commits, show_emails=True))
+
+        assert "| # | Author | Emails | Commits |" in text
+        assert "alice@example.com" in text
+
+    def test_empty_report(self) -> None:
+        report = authors_report([])
+
+        assert report["authors"] == []
+        assert "_No authors to report._" in to_markdown(report)

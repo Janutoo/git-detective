@@ -19,3 +19,7 @@ class GitReadError(GitDetectiveError):
 
 class IgnorePatternError(GitDetectiveError):
     """An exclude pattern is invalid or the ignore file cannot be read."""
+
+
+class MailmapError(GitDetectiveError):
+    """The ``.mailmap`` file cannot be read."""

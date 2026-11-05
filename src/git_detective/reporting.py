@@ -9,7 +9,7 @@ This module knows nothing about Git or the CLI; it only consumes models.
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -17,12 +17,16 @@ from pathlib import PurePath
 from typing import Any
 
 from git_detective import __version__
-from git_detective.models import CommitInfo, FileStats, Hotspot
+from git_detective.models import AuthorStats, CommitInfo, FileStats, Hotspot
 
 SCHEMA_VERSION = 1
 SCORE_DISCLAIMER = (
     "Hotspot Score (0-100) is a relative change-activity indicator, "
     "not a probability of bugs."
+)
+AUTHORS_DISCLAIMER = (
+    "Commits and churn measure activity, not productivity or the value of "
+    "anyone's work."
 )
 
 Report = dict[str, Any]
@@ -53,7 +57,12 @@ def build_scan_report(
         }
         for rank, item in enumerate(stats[:top], start=1)
     ]
-    return _build_report("scan", context, files_changed=len(stats), files=files)
+    return _build_report(
+        "scan",
+        context,
+        summary={"files_changed": len(stats), "files_reported": len(files)},
+        sections={"files": files},
+    )
 
 
 def build_hotspots_report(
@@ -76,7 +85,53 @@ def build_hotspots_report(
         }
         for rank, item in enumerate(hotspots[:top], start=1)
     ]
-    return _build_report("hotspots", context, files_changed=len(hotspots), files=files)
+    return _build_report(
+        "hotspots",
+        context,
+        summary={"files_changed": len(hotspots), "files_reported": len(files)},
+        sections={"files": files},
+    )
+
+
+def build_authors_report(
+    authors: Sequence[AuthorStats],
+    context: ReportContext,
+    *,
+    top: int,
+    show_emails: bool = False,
+) -> Report:
+    """Report for ``authors``: contributor activity.
+
+    E-mail addresses are personal data and are only included when
+    ``show_emails`` is True; otherwise the ``emails`` key is absent.
+    """
+    rows = []
+    for rank, author in enumerate(authors[:top], start=1):
+        row: dict[str, Any] = {"rank": rank, "name": author.name}
+        if show_emails:
+            row["emails"] = list(author.emails)
+        row |= {
+            "commits": author.commits,
+            "churn": author.churn,
+            "added": author.added,
+            "deleted": author.deleted,
+            "files_touched": author.files_touched,
+            "active_days": author.active_days,
+            "first_commit": author.first_commit.isoformat(),
+            "last_commit": author.last_commit.isoformat(),
+            "top_files": [
+                {"path": f.path, "commits": f.commits, "churn": f.churn}
+                for f in author.top_files
+            ],
+            "activity_by_month": dict(author.activity_by_month),
+        }
+        rows.append(row)
+    return _build_report(
+        "authors",
+        context,
+        summary={"authors_total": len(authors), "authors_reported": len(rows)},
+        sections={"authors": rows},
+    )
 
 
 def to_json(report: Mapping[str, Any]) -> str:
@@ -86,39 +141,33 @@ def to_json(report: Mapping[str, Any]) -> str:
 
 def to_markdown(report: Mapping[str, Any]) -> str:
     """Render a report as Markdown with a GitHub-flavored table."""
-    kind = report["report"]
+    spec = _MARKDOWN[report["report"]]
     summary = report["summary"]
     lines = [
-        f"# Git Detective — {_TITLES[kind]}",
+        f"# Git Detective — {spec.title}",
         "",
         f"- **Repository:** {escape_markdown(report['repository']['path'])}",
         f"- **Generated:** {escape_markdown(report['generated_at'])}",
         f"- **Commits analyzed:** {summary['commits_analyzed']}"
         + _format_period(summary["period"]),
-        f"- **Files changed:** {summary['files_changed']}"
-        f" (showing {summary['files_reported']})",
+        *(f"- {line}" for line in spec.summary_lines(summary)),
         f"- **Parameters:** {_format_parameters(report['parameters'])}",
         "",
     ]
 
-    columns = _COLUMNS[kind]
-    if report["files"]:
-        lines.append("| " + " | ".join(header for header, _, _ in columns) + " |")
-        lines.append("|" + "|".join(align for _, _, align in columns) + "|")
-        for row in report["files"]:
-            cells = [escape_markdown(fmt(row)) for _, fmt, _ in columns]
+    rows = report[spec.rows_key]
+    columns = [c for c in spec.columns if c.visible(report)]
+    if rows:
+        lines.append("| " + " | ".join(c.header for c in columns) + " |")
+        lines.append("|" + "|".join(c.align for c in columns) + "|")
+        for row in rows:
+            cells = [escape_markdown(c.cell(row)) for c in columns]
             lines.append("| " + " | ".join(cells) + " |")
     else:
-        lines.append("_No files to report._")
+        lines.append(f"_{spec.empty_message}_")
 
-    if kind == "hotspots":
-        lines += [
-            "",
-            "F, C and R are the normalized (0-1) commit frequency, churn and "
-            "recent activity used to compute the score.",
-            "",
-            f"> {SCORE_DISCLAIMER}",
-        ]
+    for note in spec.footer:
+        lines += ["", note]
     return "\n".join(lines) + "\n"
 
 
@@ -138,9 +187,10 @@ def _build_report(
     kind: str,
     context: ReportContext,
     *,
-    files_changed: int,
-    files: list[dict[str, Any]],
+    summary: Mapping[str, Any],
+    sections: Mapping[str, Any],
 ) -> Report:
+    """Wrap report-specific summary fields and sections in the common envelope."""
     return {
         "schema_version": SCHEMA_VERSION,
         "report": kind,
@@ -150,11 +200,10 @@ def _build_report(
         "parameters": _to_primitive(context.parameters),
         "summary": {
             "commits_analyzed": len(context.commits),
-            "files_changed": files_changed,
-            "files_reported": len(files),
+            **summary,
             "period": _period(context.commits),
         },
-        "files": files,
+        **sections,
     }
 
 
@@ -205,33 +254,115 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-_TITLES = {
-    "scan": "Most frequently changed files",
-    "hotspots": "Change hotspots",
-}
-
 _RIGHT = "--:"
 _LEFT = ":--"
 
-# (header, cell formatter, alignment) per report type.
-_COLUMNS = {
-    "scan": [
-        ("#", lambda r: str(r["rank"]), _RIGHT),
-        ("File", lambda r: r["path"], _LEFT),
-        ("Commits", lambda r: str(r["commits"]), _RIGHT),
-        ("Churn", lambda r: str(r["churn"]), _RIGHT),
-        ("Added", lambda r: str(r["added"]), _RIGHT),
-        ("Deleted", lambda r: str(r["deleted"]), _RIGHT),
-    ],
-    "hotspots": [
-        ("#", lambda r: str(r["rank"]), _RIGHT),
-        ("File", lambda r: r["path"], _LEFT),
-        ("Commits", lambda r: str(r["commits"]), _RIGHT),
-        ("Churn", lambda r: str(r["churn"]), _RIGHT),
-        ("Recent", lambda r: str(r["recent_commits"]), _RIGHT),
-        ("Hotspot Score", lambda r: f"{r['score']:.1f}", _RIGHT),
-        ("F", lambda r: f"{r['components']['frequency']:.2f}", _RIGHT),
-        ("C", lambda r: f"{r['components']['churn']:.2f}", _RIGHT),
-        ("R", lambda r: f"{r['components']['recency']:.2f}", _RIGHT),
-    ],
+
+def _always(_report: Mapping[str, Any]) -> bool:
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class _Column:
+    header: str
+    cell: Callable[[Mapping[str, Any]], str]
+    align: str = _RIGHT
+    visible: Callable[[Mapping[str, Any]], bool] = _always
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkdownSpec:
+    title: str
+    rows_key: str
+    columns: list[_Column]
+    summary_lines: Callable[[Mapping[str, Any]], list[str]]
+    empty_message: str
+    footer: tuple[str, ...] = ()
+
+
+def _files_summary(summary: Mapping[str, Any]) -> list[str]:
+    return [
+        f"**Files changed:** {summary['files_changed']}"
+        f" (showing {summary['files_reported']})"
+    ]
+
+
+def _authors_summary(summary: Mapping[str, Any]) -> list[str]:
+    return [
+        f"**Authors:** {summary['authors_total']}"
+        f" (showing {summary['authors_reported']})"
+    ]
+
+
+def _shows_emails(report: Mapping[str, Any]) -> bool:
+    return bool(report["parameters"].get("show_emails"))
+
+
+def _monthly_activity(row: Mapping[str, Any]) -> str:
+    return ", ".join(f"{m}: {n}" for m, n in row["activity_by_month"].items())
+
+
+_RANK = _Column("#", lambda r: str(r["rank"]))
+
+_MARKDOWN: dict[str, _MarkdownSpec] = {
+    "scan": _MarkdownSpec(
+        title="Most frequently changed files",
+        rows_key="files",
+        columns=[
+            _RANK,
+            _Column("File", lambda r: r["path"], _LEFT),
+            _Column("Commits", lambda r: str(r["commits"])),
+            _Column("Churn", lambda r: str(r["churn"])),
+            _Column("Added", lambda r: str(r["added"])),
+            _Column("Deleted", lambda r: str(r["deleted"])),
+        ],
+        summary_lines=_files_summary,
+        empty_message="No files to report.",
+    ),
+    "hotspots": _MarkdownSpec(
+        title="Change hotspots",
+        rows_key="files",
+        columns=[
+            _RANK,
+            _Column("File", lambda r: r["path"], _LEFT),
+            _Column("Commits", lambda r: str(r["commits"])),
+            _Column("Churn", lambda r: str(r["churn"])),
+            _Column("Recent", lambda r: str(r["recent_commits"])),
+            _Column("Hotspot Score", lambda r: f"{r['score']:.1f}"),
+            _Column("F", lambda r: f"{r['components']['frequency']:.2f}"),
+            _Column("C", lambda r: f"{r['components']['churn']:.2f}"),
+            _Column("R", lambda r: f"{r['components']['recency']:.2f}"),
+        ],
+        summary_lines=_files_summary,
+        empty_message="No files to report.",
+        footer=(
+            "F, C and R are the normalized (0-1) commit frequency, churn and "
+            "recent activity used to compute the score.",
+            f"> {SCORE_DISCLAIMER}",
+        ),
+    ),
+    "authors": _MarkdownSpec(
+        title="Contributors",
+        rows_key="authors",
+        columns=[
+            _RANK,
+            _Column("Author", lambda r: r["name"], _LEFT),
+            _Column("Emails", lambda r: ", ".join(r["emails"]), _LEFT, _shows_emails),
+            _Column("Commits", lambda r: str(r["commits"])),
+            _Column("Churn", lambda r: str(r["churn"])),
+            _Column("Files", lambda r: str(r["files_touched"])),
+            _Column("Active days", lambda r: str(r["active_days"])),
+            _Column("First", lambda r: r["first_commit"][:10]),
+            _Column("Last", lambda r: r["last_commit"][:10]),
+            _Column(
+                "Top files",
+                lambda r: ", ".join(f["path"] for f in r["top_files"]),
+                _LEFT,
+            ),
+            _Column("Commits per month (UTC)", _monthly_activity, _LEFT),
+        ],
+        summary_lines=_authors_summary,
+        empty_message="No authors to report.",
+        footer=(f"> {AUTHORS_DISCLAIMER}",),
+    ),
 }

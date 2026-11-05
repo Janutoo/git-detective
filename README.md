@@ -6,9 +6,10 @@ Git Detective analyzes the history of a local Git repository to show where
 the code changes most often. It is the starting point for finding code
 hotspots and understanding contributor activity.
 
-> **Status:** early development (stage 3). `scan` lists the most frequently
-> changed files, `hotspots` ranks files by a Hotspot Score. Both commands can
-> exclude files and export JSON or Markdown reports.
+> **Status:** early development (stage 4). `scan` lists the most frequently
+> changed files, `hotspots` ranks files by a Hotspot Score and `authors`
+> summarizes contributor activity. Every command can exclude files and export
+> JSON or Markdown reports.
 
 ## Features
 
@@ -17,6 +18,8 @@ hotspots and understanding contributor activity.
 - Counts added and deleted lines per file (binary files count as 0).
 - Aggregates commit count and churn (`added + deleted`) per file.
 - Ranks files by a Hotspot Score (frequency, churn, recent activity).
+- Summarizes contributor activity, with `.mailmap` alias support and
+  e-mail addresses hidden by default.
 - Excludes files with `.gitignore`-style patterns.
 - Exports reports as JSON or Markdown.
 - Read-only: Git Detective never checks out files, runs hooks, or executes
@@ -51,18 +54,28 @@ git-detective scan path/to/repo --limit 500 --top 20
 
 # Rank files by Hotspot Score
 git-detective hotspots . --recent-days 30
+
+# Contributor activity over the last 500 commits
+git-detective authors . --limit 500 --top 10
 ```
 
-Options shared by `scan` and `hotspots`:
+Options shared by all commands:
 
-| Option              | Default | Description                                         |
-| ------------------- | ------- | --------------------------------------------------- |
-| `--limit, -l`       | 100     | Maximum commits to analyze                          |
-| `--top, -t`         | 10      | Number of files to display                          |
-| `--exclude, -e`     | –       | Skip files matching a pattern (repeatable)          |
-| `--format, -f`      | `table` | `table`, `json` or `markdown`                       |
-| `--output, -o`      | stdout  | Write the report to a file (`json`/`markdown` only) |
-| `--recent-days, -r` | 30      | `hotspots` only: size of the recent activity window |
+| Option          | Default                          | Description                                         |
+| --------------- | -------------------------------- | --------------------------------------------------- |
+| `--limit, -l`   | 100 (`authors`: 500)             | Maximum commits to analyze                          |
+| `--top, -t`     | 10                               | Number of rows to display                           |
+| `--exclude, -e` | –                                | Skip files matching a pattern (repeatable)          |
+| `--format, -f`  | `table`                          | `table`, `json` or `markdown`                       |
+| `--output, -o`  | stdout                           | Write the report to a file (`json`/`markdown` only) |
+
+Command-specific options:
+
+| Option              | Command    | Default   | Description                                 |
+| ------------------- | ---------- | --------- | ------------------------------------------- |
+| `--recent-days, -r` | `hotspots` | 30        | Size of the recent activity window          |
+| `--sort, -s`        | `authors`  | `commits` | Rank by `commits` or `churn`                |
+| `--show-emails`     | `authors`  | off       | Include e-mail addresses in the output      |
 
 Example output:
 
@@ -136,6 +149,43 @@ for h in ranked[:10]:
 - **Dates** are author dates; rebases and wrong clocks can shift commits
   in or out of the recent window.
 - Merge commits are skipped and binary files have zero churn.
+
+## Contributors
+
+```bash
+git-detective authors . --limit 500 --top 10
+git-detective authors . --sort churn -f json -o authors.json
+```
+
+For every author: commits, churn (added + deleted lines), number of files
+touched, the three most frequently changed files, number of active days,
+first and last commit, and commits per month (in JSON and Markdown).
+Authors are ranked by commits (or churn with `--sort churn`); ties are broken
+by the other metric and then by name.
+
+**Identity.** Authors are grouped by name, like `git shortlog`, so commits
+made from several e-mail addresses under one name belong to one author.
+A `.mailmap` file in the repository root is applied first to merge aliases
+(different spellings, old addresses, CI identities):
+
+```
+Alice Smith <alice@work.com> <alice@home.org>
+Alice Smith <alice@work.com> asmith <ci@build.local>
+```
+
+All four Git `.mailmap` line formats are supported; matching ignores case.
+The `mailmap.file` / `mailmap.blob` Git settings are not read.
+
+**Privacy.** E-mail addresses are personal data, so they are **not shown**
+in tables or reports unless you pass `--show-emails` (JSON then gets an
+`emails` field per author). Names are always shown - keep that in mind
+before sharing a report. The contents of `.mailmap` are never printed.
+
+**Interpretation.** Commits and churn measure *activity*, not productivity
+or the value of anyone's work: a single careful fix can matter more than a
+thousand generated lines. Day and month buckets use UTC. Exclude patterns
+remove files, not commits, so they change an author's churn and files but
+not their commit count.
 
 ## Excluding files
 
@@ -241,7 +291,7 @@ or `--format markdown`.
 | Field              | Description                                                                   |
 | ------------------ | ----------------------------------------------------------------------------- |
 | `schema_version`   | Incremented on breaking changes to the structure                              |
-| `report`           | `scan` or `hotspots`                                                          |
+| `report`           | `scan`, `hotspots` or `authors`                                               |
 | `generated_at`     | When the report was created (ISO 8601 with UTC offset)                        |
 | `parameters`       | Options used for the run, incl. effective exclude patterns                    |
 | `summary.period`   | Author dates of the oldest and newest analyzed commit (`null` if none)        |
@@ -250,6 +300,30 @@ or `--format markdown`.
 
 All timestamps are ISO 8601 with their original UTC offset. Scores are
 rounded to 2 decimals, components to 4.
+
+The `authors` report shares the envelope (`schema_version` … `summary`) and
+lists contributors under `authors` instead of `files`:
+
+```json
+{
+  "rank": 1,
+  "name": "Alice Smith",
+  "commits": 42,
+  "churn": 3120,
+  "added": 2400,
+  "deleted": 720,
+  "files_touched": 37,
+  "active_days": 18,
+  "first_commit": "2026-06-02T09:15:00+02:00",
+  "last_commit": "2026-11-03T17:40:00+01:00",
+  "top_files": [{ "path": "src/app/main.py", "commits": 12, "churn": 640 }],
+  "activity_by_month": { "2026-06": 5, "2026-07": 9 }
+}
+```
+
+Its summary has `authors_total` / `authors_reported`, and `parameters`
+records `sort`, `show_emails` and whether `.mailmap` was used. The `emails`
+list appears only with `--show-emails`.
 
 ### Markdown format
 
@@ -276,18 +350,22 @@ File names and other values are escaped, so characters such as `|`, `_`,
 
 ```
 src/git_detective/
-├── cli.py              # Typer CLI + Rich output (presentation layer)
+├── cli.py              # Typer commands and orchestration (presentation layer)
+├── tables.py           # Rich tables for terminal output
 ├── reporting.py        # JSON / Markdown reports (no Git or CLI code)
 ├── exceptions.py       # Project-specific errors
 ├── core/
 │   ├── git_reader.py   # Reads commits and per-file line changes from Git
 │   ├── filters.py      # --exclude / .gitdetectiveignore path filtering
 │   ├── analyzer.py     # Aggregates commits into per-file statistics
-│   └── hotspots.py     # Hotspot Score: normalization, weights, ranking
+│   ├── hotspots.py     # Hotspot Score: normalization, weights, ranking
+│   ├── mailmap.py      # .mailmap parsing and alias resolution
+│   └── authors.py      # Contributor statistics
 └── models/
     ├── commit.py       # CommitInfo, FileChange
     ├── file_stats.py   # FileStats
-    └── hotspot.py      # Hotspot
+    ├── hotspot.py      # Hotspot
+    └── author.py       # AuthorStats
 ```
 
 ## Development
@@ -318,6 +396,5 @@ commands from the list above.
 
 ## Roadmap
 
-- Contributor statistics (who changes what, and how often)
 - Time filters such as `--since` / `--until`
 - Combining hotspots with code complexity

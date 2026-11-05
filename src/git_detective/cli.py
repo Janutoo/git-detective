@@ -14,7 +14,6 @@ from typing import Any, NoReturn
 import typer
 from rich.console import Console
 from rich.markup import escape
-from rich.table import Table
 
 from git_detective import __version__
 from git_detective.core import (
@@ -22,25 +21,38 @@ from git_detective.core import (
     DEFAULT_RECENT_DAYS,
     DEFAULT_WEIGHTS,
     IGNORE_FILE_NAME,
+    MAILMAP_FILE_NAME,
+    AuthorSort,
     GitReader,
+    Mailmap,
     PathFilter,
     aggregate_file_stats,
+    compute_author_stats,
     compute_hotspots,
     filter_commits,
     read_ignore_file,
+    read_mailmap,
 )
 from git_detective.exceptions import GitDetectiveError
-from git_detective.models import CommitInfo, FileStats, Hotspot
+from git_detective.models import CommitInfo
 from git_detective.reporting import (
     Report,
     ReportContext,
+    build_authors_report,
     build_hotspots_report,
     build_scan_report,
     to_json,
     to_markdown,
 )
+from git_detective.tables import (
+    build_authors_table,
+    build_hotspot_table,
+    build_scan_table,
+)
 
 DEFAULT_TOP = 10
+# History-oriented analyses (authors, coupling) need a longer window by default.
+DEFAULT_HISTORY_LIMIT = 500
 
 
 class OutputFormat(StrEnum):
@@ -135,8 +147,8 @@ def scan(
                 f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
             )
             return
-        _print_header(analysis, files_changed=len(stats))
-        console.print(_build_table(stats[:top]))
+        _print_header(analysis, f"[bold]{len(stats)}[/] files changed")
+        console.print(build_scan_table(stats[:top]))
         return
 
     context = _report_context(analysis, {"limit": limit, "top": top})
@@ -174,9 +186,9 @@ def hotspots(
             )
             return
         since = (now - timedelta(days=recent_days)).date().isoformat()
-        _print_header(analysis, files_changed=len(ranked))
+        _print_header(analysis, f"[bold]{len(ranked)}[/] files changed")
         console.print(f"Recent window: last {recent_days} days (since {since})")
-        console.print(_build_hotspot_table(ranked[:top]))
+        console.print(build_hotspot_table(ranked[:top]))
         return
 
     parameters = {
@@ -188,6 +200,61 @@ def hotspots(
     }
     context = _report_context(analysis, parameters, generated_at=now)
     _emit(build_hotspots_report(ranked, context, top=top), output_format, output)
+
+
+@app.command()
+def authors(
+    path: Path = PATH_ARGUMENT,
+    limit: int = typer.Option(
+        DEFAULT_HISTORY_LIMIT, "--limit", "-l", min=1, help="Max commits to analyze."
+    ),
+    top: int = typer.Option(
+        DEFAULT_TOP, "--top", "-t", min=1, help="Number of authors to display."
+    ),
+    sort: AuthorSort = typer.Option(
+        AuthorSort.COMMITS,
+        "--sort",
+        "-s",
+        case_sensitive=False,
+        help="Rank authors by commit count or by churn.",
+    ),
+    show_emails: bool = typer.Option(
+        False,
+        "--show-emails",
+        help="Include author e-mail addresses (hidden by default for privacy).",
+    ),
+    exclude: list[str] | None = EXCLUDE_OPTION,
+    output_format: OutputFormat = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
+) -> None:
+    """Show contributor activity: commits, churn, files and active period."""
+    _check_output_option(output_format, output)
+    analysis = _prepare(path, limit, exclude)
+    mailmap = _load_mailmap(analysis.root)
+    ranked = compute_author_stats(analysis.commits, mailmap=mailmap, sort_by=sort)
+
+    if output_format is OutputFormat.TABLE:
+        if not analysis.commits:
+            console.print(
+                f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
+            )
+            return
+        _print_header(analysis, f"[bold]{len(ranked)}[/] authors")
+        if mailmap:
+            console.print(f"[dim]Aliases resolved with {MAILMAP_FILE_NAME}[/]")
+        console.print(build_authors_table(ranked[:top], show_emails=show_emails))
+        return
+
+    parameters = {
+        "limit": limit,
+        "top": top,
+        "sort": sort,
+        "show_emails": show_emails,
+        "mailmap": MAILMAP_FILE_NAME if mailmap else None,
+    }
+    context = _report_context(analysis, parameters)
+    report = build_authors_report(ranked, context, top=top, show_emails=show_emails)
+    _emit(report, output_format, output)
 
 
 def _utc_now() -> datetime:
@@ -234,6 +301,13 @@ def _prepare(path: Path, limit: int, exclude: list[str] | None) -> _Analysis:
     )
 
 
+def _load_mailmap(root: Path) -> Mailmap:
+    try:
+        return read_mailmap(root / MAILMAP_FILE_NAME)
+    except GitDetectiveError as exc:
+        _fail(exc)
+
+
 def _report_context(
     analysis: _Analysis,
     parameters: dict[str, Any],
@@ -271,68 +345,12 @@ def _emit(report: Report, output_format: OutputFormat, output: Path | None) -> N
     error_console.print(f"Report written to {escape(str(output))}")
 
 
-def _print_header(analysis: _Analysis, *, files_changed: int) -> None:
+def _print_header(analysis: _Analysis, detail: str) -> None:
+    """Print "Analyzed N commits in <repo> (<detail>)" and active exclusions."""
     console.print(
         f"Analyzed [bold cyan]{len(analysis.commits)}[/] commits in "
-        f"[bold]{escape(str(analysis.root))}[/] "
-        f"([bold]{files_changed}[/] files changed)"
+        f"[bold]{escape(str(analysis.root))}[/] ({detail})"
     )
     if analysis.path_filter:
         patterns = ", ".join(analysis.path_filter.patterns)
         console.print(f"[dim]Excluding: {escape(patterns)}[/]")
-
-
-def _build_hotspot_table(ranked: list[Hotspot]) -> Table:
-    table = Table(
-        title="Change hotspots",
-        title_justify="left",
-        caption="Hotspot Score (0-100) = relative change activity, "
-        "not a probability of bugs.",
-        caption_justify="left",
-    )
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("File", overflow="fold")
-    table.add_column("Commits", justify="right")
-    table.add_column("Churn", justify="right")
-    table.add_column("Recent", justify="right")
-    table.add_column("Hotspot Score", justify="right", style="bold")
-
-    for rank, item in enumerate(ranked, start=1):
-        table.add_row(
-            str(rank),
-            escape(item.path),
-            str(item.commits),
-            str(item.churn),
-            str(item.recent_commits),
-            f"[{_score_style(item.score)}]{item.score:.1f}[/]",
-        )
-    return table
-
-
-def _score_style(score: float) -> str:
-    if score >= 70:
-        return "red"
-    if score >= 40:
-        return "yellow"
-    return "green"
-
-
-def _build_table(stats: list[FileStats]) -> Table:
-    table = Table(title="Most frequently changed files", title_justify="left")
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("File", overflow="fold")
-    table.add_column("Commits", justify="right", style="bold")
-    table.add_column("Churn", justify="right")
-    table.add_column("+", justify="right", style="green")
-    table.add_column("-", justify="right", style="red")
-
-    for rank, item in enumerate(stats, start=1):
-        table.add_row(
-            str(rank),
-            escape(item.path),
-            str(item.commits),
-            str(item.churn),
-            str(item.added),
-            str(item.deleted),
-        )
-    return table

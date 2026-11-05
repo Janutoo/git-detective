@@ -5,10 +5,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from git import Repo
+from git import Actor, Repo
 from typer.testing import CliRunner
 
-from git_detective import __version__
+from git_detective import __version__, cli
 from git_detective.cli import app
 
 CommitFn = Callable[..., str]
@@ -469,3 +469,138 @@ def test_unknown_format_is_rejected(hotspot_repo: Repo, command: str) -> None:
 
     assert result.exit_code == 2
     assert "xml" in plain(result.output)
+
+
+# --- authors -----------------------------------------------------------------
+
+ALICE = Actor("Alice Smith", "alice@work.com")
+ALICE_HOME = Actor("alice", "alice@home.org")
+BOB = Actor("Bob", "bob@example.com")
+
+
+@pytest.fixture
+def team_repo(repo: Repo, make_commit: CommitFn) -> Repo:
+    """Alice: 3 commits (one under an alias), Bob: 1 commit with large churn."""
+    make_commit({"src/app.py": "1\n"}, author=ALICE, timestamp=ts(40))
+    make_commit({"src/app.py": "2\n"}, author=ALICE, timestamp=ts(20))
+    make_commit({"docs/notes.md": "x\n"}, author=ALICE_HOME, timestamp=ts(3))
+    make_commit(
+        {"vendor/big.js": "v\n" * 200, "poetry.lock": "l\n" * 50},
+        author=BOB,
+        timestamp=ts(2),
+    )
+    return repo
+
+
+def authors_json(repo: Repo, *args: str) -> dict:
+    result = runner.invoke(app, ["authors", repo.working_tree_dir, "-f", "json", *args])
+    assert result.exit_code == 0, result.output
+    return json.loads(result.stdout)
+
+
+def by_author(data: dict) -> dict[str, dict]:
+    return {a["name"]: a for a in data["authors"]}
+
+
+@pytest.fixture
+def wide_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Render wide tables (e.g. authors) without wrapping cells or headers."""
+    monkeypatch.setattr(cli.console, "width", 250)
+
+
+@pytest.mark.usefixtures("wide_console")
+class TestAuthorsCommand:
+    def test_table(self, team_repo: Repo) -> None:
+        result = runner.invoke(app, ["authors", team_repo.working_tree_dir])
+
+        assert result.exit_code == 0, result.output
+        assert "Analyzed 4 commits" in result.output
+        assert "(3 authors)" in result.output
+        for header in ("Author", "Commits", "Churn", "Files", "Active days"):
+            assert header in result.output
+        assert table_row(result.output, "Alice Smith")[2] == "2"
+        assert "@" not in result.output  # e-mails are hidden by default
+
+    def test_json(self, team_repo: Repo) -> None:
+        data = authors_json(team_repo)
+
+        assert data["report"] == "authors"
+        assert data["parameters"]["limit"] == 500
+        assert data["parameters"]["show_emails"] is False
+        assert data["parameters"]["mailmap"] is None
+        assert [a["name"] for a in data["authors"]] == ["Alice Smith", "Bob", "alice"]
+        assert "@" not in json.dumps(data["authors"])
+
+    def test_sort_by_churn(self, team_repo: Repo) -> None:
+        data = authors_json(team_repo, "--sort", "churn")
+
+        assert data["authors"][0]["name"] == "Bob"
+        assert data["parameters"]["sort"] == "churn"
+
+    def test_top(self, team_repo: Repo) -> None:
+        data = authors_json(team_repo, "--top", "1")
+
+        assert len(data["authors"]) == 1
+        assert data["summary"]["authors_total"] == 3
+
+    def test_show_emails(self, team_repo: Repo) -> None:
+        data = authors_json(team_repo, "--show-emails")
+        result = runner.invoke(
+            app, ["authors", team_repo.working_tree_dir, "--show-emails"]
+        )
+
+        assert data["authors"][0]["emails"] == ["alice@work.com"]
+        assert "alice@work.com" in result.output
+
+    def test_mailmap_merges_aliases(self, team_repo: Repo) -> None:
+        (Path(team_repo.working_tree_dir) / ".mailmap").write_text(
+            "Alice Smith <alice@work.com> <alice@home.org>\n", encoding="utf-8"
+        )
+
+        data = authors_json(team_repo, "--show-emails")
+        table = runner.invoke(app, ["authors", team_repo.working_tree_dir])
+
+        assert [a["name"] for a in data["authors"]] == ["Alice Smith", "Bob"]
+        assert data["authors"][0]["commits"] == 3
+        assert data["authors"][0]["emails"] == ["alice@work.com"]
+        assert data["parameters"]["mailmap"] == ".mailmap"
+        assert "Aliases resolved with .mailmap" in table.output
+
+    def test_exclude_changes_churn_not_commits(self, team_repo: Repo) -> None:
+        before = by_author(authors_json(team_repo))["Bob"]
+        after = by_author(authors_json(team_repo, "-e", "vendor/", "-e", "*.lock"))[
+            "Bob"
+        ]
+
+        assert before["commits"] == after["commits"] == 1
+        assert (before["churn"], after["churn"]) == (250, 0)
+        assert after["files_touched"] == 0
+
+    def test_markdown(self, team_repo: Repo) -> None:
+        result = runner.invoke(
+            app, ["authors", team_repo.working_tree_dir, "-f", "markdown"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout.startswith("# Git Detective — Contributors\n")
+        assert "| 1 | Alice Smith | 2 |" in result.stdout
+
+    def test_empty_repository(self, repo: Repo) -> None:
+        table = runner.invoke(app, ["authors", repo.working_tree_dir])
+        data = authors_json(repo)
+
+        assert "No commits found" in table.output
+        assert data["authors"] == []
+
+    def test_invalid_path(self, tmp_path: Path) -> None:
+        result = runner.invoke(app, ["authors", str(tmp_path / "missing")])
+
+        assert result.exit_code == 1
+        assert "does not exist" in result.stderr
+
+    def test_unknown_sort(self, team_repo: Repo) -> None:
+        result = runner.invoke(
+            app, ["authors", team_repo.working_tree_dir, "--sort", "lines"]
+        )
+
+        assert result.exit_code == 2
