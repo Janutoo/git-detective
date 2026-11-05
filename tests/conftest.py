@@ -4,11 +4,18 @@ Tests never touch the user's real repositories and do not depend on the
 global ``git config`` (author and committer are always set explicitly).
 """
 
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 from git import Actor, Repo
+
+# CLI tests compare plain text. Rich reads these variables when the CLI's
+# consoles are created (at import time), so drop them before any test module
+# imports git_detective.cli; otherwise output would contain ANSI color codes.
+for _var in ("FORCE_COLOR", "PY_COLORS"):
+    os.environ.pop(_var, None)
 
 DEFAULT_AUTHOR = Actor("Alice Example", "alice@example.com")
 BASE_TIMESTAMP = 1_704_110_400  # 2024-01-01 12:00:00 UTC

@@ -14,6 +14,17 @@ from git_detective.cli import app
 CommitFn = Callable[..., str]
 runner = CliRunner()
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """Strip ANSI styles.
+
+    Rich colors Typer's usage errors when it detects CI (e.g. GitHub Actions),
+    which can split words such as ``--output`` into separately styled parts.
+    """
+    return ANSI_ESCAPE.sub("", text)
+
 
 def test_scan_shows_commit_count_and_files(repo: Repo, make_commit: CommitFn) -> None:
     make_commit({"hot.py": "1\n", "cold.py": "1\n"})
@@ -446,7 +457,7 @@ class TestOutputFile:
         )
 
         assert result.exit_code == 2
-        assert "--output" in result.output
+        assert "--output" in plain(result.output)
         assert not target.exists()
 
 
@@ -457,4 +468,4 @@ def test_unknown_format_is_rejected(hotspot_repo: Repo, command: str) -> None:
     )
 
     assert result.exit_code == 2
-    assert "xml" in result.output
+    assert "xml" in plain(result.output)
