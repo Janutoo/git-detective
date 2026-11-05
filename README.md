@@ -7,9 +7,10 @@ the code changes most often. It is the starting point for finding code
 hotspots and understanding contributor activity.
 
 > **Status:** early development (stage 4). `scan` lists the most frequently
-> changed files, `hotspots` ranks files by a Hotspot Score and `authors`
-> summarizes contributor activity. Every command can exclude files and export
-> JSON or Markdown reports.
+> changed files, `hotspots` ranks files by a Hotspot Score, `authors`
+> summarizes contributor activity and `coupling` finds files that change
+> together. Every command can exclude files and export JSON or Markdown
+> reports.
 
 ## Features
 
@@ -20,6 +21,7 @@ hotspots and understanding contributor activity.
 - Ranks files by a Hotspot Score (frequency, churn, recent activity).
 - Summarizes contributor activity, with `.mailmap` alias support and
   e-mail addresses hidden by default.
+- Detects file coupling: pairs of files that change in the same commits.
 - Excludes files with `.gitignore`-style patterns.
 - Exports reports as JSON or Markdown.
 - Read-only: Git Detective never checks out files, runs hooks, or executes
@@ -57,25 +59,30 @@ git-detective hotspots . --recent-days 30
 
 # Contributor activity over the last 500 commits
 git-detective authors . --limit 500 --top 10
+
+# Files that change together
+git-detective coupling . --limit 500 --top 20
 ```
 
 Options shared by all commands:
 
-| Option          | Default                          | Description                                         |
-| --------------- | -------------------------------- | --------------------------------------------------- |
-| `--limit, -l`   | 100 (`authors`: 500)             | Maximum commits to analyze                          |
-| `--top, -t`     | 10                               | Number of rows to display                           |
-| `--exclude, -e` | –                                | Skip files matching a pattern (repeatable)          |
-| `--format, -f`  | `table`                          | `table`, `json` or `markdown`                       |
-| `--output, -o`  | stdout                           | Write the report to a file (`json`/`markdown` only) |
+| Option          | Default                              | Description                                         |
+| --------------- | ------------------------------------ | --------------------------------------------------- |
+| `--limit, -l`   | 100 (`authors`, `coupling`: 500)     | Maximum commits to analyze                          |
+| `--top, -t`     | 10 (`coupling`: 20)                  | Number of rows to display                           |
+| `--exclude, -e` | –                                    | Skip files matching a pattern (repeatable)          |
+| `--format, -f`  | `table`                              | `table`, `json` or `markdown`                       |
+| `--output, -o`  | stdout                               | Write the report to a file (`json`/`markdown` only) |
 
 Command-specific options:
 
-| Option              | Command    | Default   | Description                                 |
-| ------------------- | ---------- | --------- | ------------------------------------------- |
-| `--recent-days, -r` | `hotspots` | 30        | Size of the recent activity window          |
-| `--sort, -s`        | `authors`  | `commits` | Rank by `commits` or `churn`                |
-| `--show-emails`     | `authors`  | off       | Include e-mail addresses in the output      |
+| Option                   | Command    | Default   | Description                                  |
+| ------------------------ | ---------- | --------- | -------------------------------------------- |
+| `--recent-days, -r`      | `hotspots` | 30        | Size of the recent activity window           |
+| `--sort, -s`             | `authors`  | `commits` | Rank by `commits` or `churn`                 |
+| `--show-emails`          | `authors`  | off       | Include e-mail addresses in the output       |
+| `--min-cochanges`        | `coupling` | 3         | Ignore pairs changed together less often     |
+| `--max-files-per-commit` | `coupling` | 50        | Skip larger commits (bulk changes)           |
 
 Example output:
 
@@ -187,6 +194,49 @@ thousand generated lines. Day and month buckets use UTC. Exclude patterns
 remove files, not commits, so they change an author's churn and files but
 not their commit count.
 
+## File coupling
+
+```bash
+git-detective coupling . --limit 500 --top 20
+git-detective coupling . --min-cochanges 5 --max-files-per-commit 30 -e "*.lock"
+```
+
+Lists pairs of files that were changed in the same commits:
+
+| Metric        | Meaning                                                                    |
+| ------------- | -------------------------------------------------------------------------- |
+| `cochanges`   | commits that changed both files                                            |
+| `commits_a/b` | commits that changed each file                                             |
+| `jaccard`     | `cochanges / (commits_a + commits_b - cochanges)`; 1.0 = always together   |
+
+Pairs are ranked by Jaccard similarity, then by co-changes, then by path.
+
+**Noise control.** Large commits (mass refactors, reformatting, dependency
+bumps, vendored code) would make every file look coupled to every other one.
+Git Detective therefore:
+
+1. **skips commits with more than `--max-files-per-commit` files entirely** -
+   they count neither towards pairs nor towards per-file commit counts, so
+   Jaccard is always computed over one consistent set of commits (the number
+   of skipped commits is shown and reported);
+2. drops pairs changed together fewer than `--min-cochanges` times, where a
+   high Jaccard would be a coincidence;
+3. applies your exclude patterns first, so lockfiles and generated files can
+   be removed (which can also bring a large commit under the size limit).
+
+The size limit also keeps the computation fast: a commit with *n* files
+yields *n·(n-1)/2* pairs, so the work is bounded by
+`limit × max_files_per_commit² / 2`.
+
+**Interpretation.** Co-change does **not** prove that two modules depend on
+each other. A strong pair is a hint worth a closer look: a hidden
+dependency, duplicated logic, a missing abstraction - or simply code and its
+tests, which is expected.
+
+The JSON report also contains a `graph` with `nodes` (files, with commit
+counts) and `edges` (pairs, with co-changes and Jaccard) for the reported
+pairs, ready to be drawn by a graph library.
+
 ## Excluding files
 
 ```bash
@@ -291,7 +341,7 @@ or `--format markdown`.
 | Field              | Description                                                                   |
 | ------------------ | ----------------------------------------------------------------------------- |
 | `schema_version`   | Incremented on breaking changes to the structure                              |
-| `report`           | `scan`, `hotspots` or `authors`                                               |
+| `report`           | `scan`, `hotspots`, `authors` or `coupling`                                   |
 | `generated_at`     | When the report was created (ISO 8601 with UTC offset)                        |
 | `parameters`       | Options used for the run, incl. effective exclude patterns                    |
 | `summary.period`   | Author dates of the oldest and newest analyzed commit (`null` if none)        |
@@ -324,6 +374,41 @@ lists contributors under `authors` instead of `files`:
 Its summary has `authors_total` / `authors_reported`, and `parameters`
 records `sort`, `show_emails` and whether `.mailmap` was used. The `emails`
 list appears only with `--show-emails`.
+
+The `coupling` report lists `pairs` and a `graph` built from them:
+
+```json
+{
+  "summary": {
+    "commits_analyzed": 500,
+    "commits_considered": 488,
+    "commits_skipped": 12,
+    "pairs_total": 143,
+    "pairs_reported": 20,
+    "period": { "from": "2026-03-01T10:00:00+01:00", "to": "2026-11-03T18:40:11+01:00" }
+  },
+  "pairs": [
+    {
+      "rank": 1,
+      "file_a": "src/api.py",
+      "file_b": "src/client.py",
+      "cochanges": 9,
+      "commits_a": 12,
+      "commits_b": 10,
+      "jaccard": 0.6923
+    }
+  ],
+  "graph": {
+    "nodes": [
+      { "id": "src/api.py", "commits": 12 },
+      { "id": "src/client.py", "commits": 10 }
+    ],
+    "edges": [
+      { "source": "src/api.py", "target": "src/client.py", "cochanges": 9, "jaccard": 0.6923 }
+    ]
+  }
+}
+```
 
 ### Markdown format
 
@@ -360,12 +445,14 @@ src/git_detective/
 │   ├── analyzer.py     # Aggregates commits into per-file statistics
 │   ├── hotspots.py     # Hotspot Score: normalization, weights, ranking
 │   ├── mailmap.py      # .mailmap parsing and alias resolution
-│   └── authors.py      # Contributor statistics
+│   ├── authors.py      # Contributor statistics
+│   └── coupling.py     # Co-change pairs and Jaccard similarity
 └── models/
     ├── commit.py       # CommitInfo, FileChange
     ├── file_stats.py   # FileStats
     ├── hotspot.py      # Hotspot
-    └── author.py       # AuthorStats
+    ├── author.py       # AuthorStats
+    └── coupling.py     # FileCoupling, CouplingResult
 ```
 
 ## Development

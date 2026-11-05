@@ -604,3 +604,147 @@ class TestAuthorsCommand:
         )
 
         assert result.exit_code == 2
+
+
+# --- coupling ----------------------------------------------------------------
+
+
+@pytest.fixture
+def coupled_repo(repo: Repo, make_commit: CommitFn) -> Repo:
+    """api.py + client.py change together 3x; one bulk commit touches 6 files."""
+    for i in range(3):
+        make_commit({"src/api.py": f"{i}\n", "src/client.py": f"{i}\n"})
+    make_commit({"src/api.py": "x\n", "src/api.lock": "x\n"})
+    make_commit({"src/api.py": "y\n", "src/api.lock": "y\n"})
+    make_commit({"src/api.py": "z\n", "src/api.lock": "z\n"})
+    make_commit({f"bulk/{i}.txt": "b\n" for i in range(6)})
+    return repo
+
+
+def coupling_json(repo: Repo, *args: str) -> dict:
+    result = runner.invoke(
+        app, ["coupling", repo.working_tree_dir, "-f", "json", *args]
+    )
+    assert result.exit_code == 0, result.output
+    return json.loads(result.stdout)
+
+
+def pair_names(data: dict) -> list[tuple[str, str]]:
+    return [(p["file_a"], p["file_b"]) for p in data["pairs"]]
+
+
+@pytest.mark.usefixtures("wide_console")
+class TestCouplingCommand:
+    def test_table(self, coupled_repo: Repo) -> None:
+        result = runner.invoke(app, ["coupling", coupled_repo.working_tree_dir])
+
+        assert result.exit_code == 0, result.output
+        assert "Analyzed 7 commits" in result.output
+        assert "skipped 0 with more than 50 files" in result.output
+        assert table_row(result.output, "src/client.py") == [
+            "2",
+            "src/api.py",
+            "src/client.py",
+            "3",
+            "0.50",
+        ]
+        # The caption wraps to the table width.
+        assert "not proof of a dependency" in " ".join(result.output.split())
+
+    def test_json_defaults(self, coupled_repo: Repo) -> None:
+        data = coupling_json(coupled_repo)
+
+        assert data["report"] == "coupling"
+        assert data["parameters"] == {
+            "limit": 500,
+            "top": 20,
+            "min_cochanges": 3,
+            "max_files_per_commit": 50,
+            "exclude": [],
+            "ignore_file": None,
+        }
+        assert pair_names(data)[:2] == [
+            ("src/api.lock", "src/api.py"),
+            ("src/api.py", "src/client.py"),
+        ]
+        assert {"nodes", "edges"} == set(data["graph"])
+
+    def test_max_files_per_commit_skips_bulk_commit(self, coupled_repo: Repo) -> None:
+        # --min-cochanges 1 so the single bulk commit could create pairs at all.
+        default = coupling_json(coupled_repo, "--min-cochanges", "1")
+        strict = coupling_json(
+            coupled_repo, "--min-cochanges", "1", "--max-files-per-commit", "5"
+        )
+
+        def bulk_pairs(data: dict) -> int:
+            return sum(a.startswith("bulk/") for a, _ in pair_names(data))
+
+        assert default["summary"]["commits_skipped"] == 0
+        assert bulk_pairs(default) == 15  # 6 files -> 15 artificial pairs
+        assert strict["summary"]["commits_skipped"] == 1
+        assert strict["summary"]["commits_considered"] == 6
+        assert bulk_pairs(strict) == 0
+
+    def test_min_cochanges(self, coupled_repo: Repo) -> None:
+        loose = coupling_json(coupled_repo, "--min-cochanges", "1")
+        strict = coupling_json(coupled_repo, "--min-cochanges", "4")
+
+        assert ("bulk/0.txt", "bulk/1.txt") in pair_names(loose)
+        assert strict["pairs"] == []
+
+    def test_exclude(self, coupled_repo: Repo) -> None:
+        data = coupling_json(coupled_repo, "-e", "*.lock")
+
+        assert pair_names(data) == [("src/api.py", "src/client.py")]
+        assert data["parameters"]["exclude"] == ["*.lock"]
+
+    def test_ignore_file(self, coupled_repo: Repo) -> None:
+        write_ignore_file(coupled_repo, "*.lock\n")
+
+        data = coupling_json(coupled_repo)
+
+        assert pair_names(data) == [("src/api.py", "src/client.py")]
+        assert data["parameters"]["ignore_file"] == ".gitdetectiveignore"
+
+    def test_top(self, coupled_repo: Repo) -> None:
+        data = coupling_json(coupled_repo, "--top", "1")
+
+        assert len(data["pairs"]) == 1
+        assert data["summary"]["pairs_total"] == 2
+
+    def test_markdown_to_file(self, coupled_repo: Repo, tmp_path: Path) -> None:
+        target = tmp_path / "coupling.md"
+
+        result = runner.invoke(
+            app,
+            [
+                "coupling",
+                coupled_repo.working_tree_dir,
+                "-f",
+                "markdown",
+                "-o",
+                str(target),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == ""
+        content = target.read_text(encoding="utf-8")
+        assert content.startswith("# Git Detective — File coupling\n")
+        assert "| src/api.py | src/client.py | 3 |" in content
+
+    def test_empty_repository(self, repo: Repo) -> None:
+        table = runner.invoke(app, ["coupling", repo.working_tree_dir])
+        data = coupling_json(repo)
+
+        assert "No commits found" in table.output
+        assert data["pairs"] == []
+        assert data["graph"] == {"nodes": [], "edges": []}
+
+    @pytest.mark.parametrize(
+        "args", [["--min-cochanges", "0"], ["--max-files-per-commit", "1"]]
+    )
+    def test_invalid_options(self, coupled_repo: Repo, args: list[str]) -> None:
+        result = runner.invoke(app, ["coupling", coupled_repo.working_tree_dir, *args])
+
+        assert result.exit_code == 2

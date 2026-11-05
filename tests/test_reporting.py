@@ -10,12 +10,14 @@ import pytest
 from git_detective import __version__
 from git_detective.core.analyzer import aggregate_file_stats
 from git_detective.core.authors import compute_author_stats
+from git_detective.core.coupling import compute_coupling
 from git_detective.core.hotspots import compute_hotspots
 from git_detective.models import CommitInfo, FileChange
 from git_detective.reporting import (
     SCHEMA_VERSION,
     ReportContext,
     build_authors_report,
+    build_coupling_report,
     build_hotspots_report,
     build_scan_report,
     escape_markdown,
@@ -406,3 +408,135 @@ class TestAuthorsReport:
 
         assert report["authors"] == []
         assert "_No authors to report._" in to_markdown(report)
+
+
+# --- Coupling report ---------------------------------------------------------
+
+
+def changed(*paths: str) -> CommitInfo:
+    return CommitInfo(
+        hexsha="c" * 40,
+        author_name="Alice",
+        author_email="alice@example.com",
+        authored_at=GENERATED,
+        message="msg",
+        files=tuple(FileChange(p, 1, 0) for p in paths),
+    )
+
+
+@pytest.fixture
+def coupled_commits() -> list[CommitInfo]:
+    return [
+        *[changed("src/api.py", "src/client.py")] * 3,
+        *[changed("src/api.py", "tests/test_api.py")] * 2,
+        changed("src/api.py"),
+        changed(*[f"gen/{i}.js" for i in range(5)]),  # skipped: too many files
+    ]
+
+
+def coupling_report(commits: list[CommitInfo], *, top: int = 20) -> dict:
+    ctx = ReportContext(
+        repository=Path("/work/repo"),
+        generated_at=GENERATED,
+        commits=commits,
+        parameters={"min_cochanges": 2, "max_files_per_commit": 4},
+    )
+    result = compute_coupling(commits, min_cochanges=2, max_files_per_commit=4)
+    return build_coupling_report(result, ctx, top=top)
+
+
+class TestCouplingReport:
+    def test_json_structure(self, coupled_commits: list[CommitInfo]) -> None:
+        data = json.loads(to_json(coupling_report(coupled_commits)))
+
+        assert data["report"] == "coupling"
+        assert list(data)[-2:] == ["pairs", "graph"]
+        assert data["summary"] == {
+            "commits_analyzed": 7,
+            "commits_considered": 6,
+            "commits_skipped": 1,
+            "pairs_total": 2,
+            "pairs_reported": 2,
+            "period": {
+                "from": "2024-07-01T12:00:00+00:00",
+                "to": "2024-07-01T12:00:00+00:00",
+            },
+        }
+        assert data["pairs"] == [
+            {
+                "rank": 1,
+                "file_a": "src/api.py",
+                "file_b": "src/client.py",
+                "cochanges": 3,
+                "commits_a": 6,
+                "commits_b": 3,
+                "jaccard": 0.5,
+            },
+            {
+                "rank": 2,
+                "file_a": "src/api.py",
+                "file_b": "tests/test_api.py",
+                "cochanges": 2,
+                "commits_a": 6,
+                "commits_b": 2,
+                "jaccard": 0.3333,
+            },
+        ]
+
+    def test_graph_matches_pairs(self, coupled_commits: list[CommitInfo]) -> None:
+        graph = coupling_report(coupled_commits)["graph"]
+
+        assert graph["nodes"] == [
+            {"id": "src/api.py", "commits": 6},
+            {"id": "src/client.py", "commits": 3},
+            {"id": "tests/test_api.py", "commits": 2},
+        ]
+        assert graph["edges"] == [
+            {
+                "source": "src/api.py",
+                "target": "src/client.py",
+                "cochanges": 3,
+                "jaccard": 0.5,
+            },
+            {
+                "source": "src/api.py",
+                "target": "tests/test_api.py",
+                "cochanges": 2,
+                "jaccard": 0.3333,
+            },
+        ]
+
+    def test_top_limits_pairs_and_graph(
+        self, coupled_commits: list[CommitInfo]
+    ) -> None:
+        report = coupling_report(coupled_commits, top=1)
+
+        assert len(report["pairs"]) == 1
+        assert report["summary"]["pairs_total"] == 2
+        assert len(report["graph"]["edges"]) == 1
+        assert [n["id"] for n in report["graph"]["nodes"]] == [
+            "src/api.py",
+            "src/client.py",
+        ]
+
+    def test_markdown(self, coupled_commits: list[CommitInfo]) -> None:
+        text = to_markdown(coupling_report(coupled_commits))
+        lines = text.splitlines()
+
+        assert lines[0] == "# Git Detective — File coupling"
+        assert "- **Commits considered:** 6 (1 skipped as too large)" in lines
+        assert "- **Pairs:** 2 (showing 2)" in lines
+        assert (
+            "| # | File A | File B | Co-changes | Commits A | Commits B | Jaccard |"
+            in lines
+        )
+        assert "| 1 | src/api.py | src/client.py | 3 | 6 | 3 | 0.50 |" in lines
+        assert "| 2 | src/api.py | tests/test\\_api.py | 2 | 6 | 2 | 0.33 |" in lines
+        assert "not necessarily dependent" in text
+
+    def test_empty_report(self) -> None:
+        report = coupling_report([])
+
+        assert report["pairs"] == []
+        assert report["graph"] == {"nodes": [], "edges": []}
+        assert "_No file pairs reached" in to_markdown(report)

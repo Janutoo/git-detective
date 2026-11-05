@@ -2,7 +2,16 @@
 
 from git_detective.models.author import AuthorStats
 from git_detective.models.commit import CommitInfo, FileChange
+from git_detective.models.coupling import CouplingResult, FileCoupling
 from git_detective.models.file_stats import FileStats
 from git_detective.models.hotspot import Hotspot
 
-__all__ = ["AuthorStats", "CommitInfo", "FileChange", "FileStats", "Hotspot"]
+__all__ = [
+    "AuthorStats",
+    "CommitInfo",
+    "CouplingResult",
+    "FileChange",
+    "FileCoupling",
+    "FileStats",
+    "Hotspot",
+]

@@ -17,7 +17,14 @@ from pathlib import PurePath
 from typing import Any
 
 from git_detective import __version__
-from git_detective.models import AuthorStats, CommitInfo, FileStats, Hotspot
+from git_detective.models import (
+    AuthorStats,
+    CommitInfo,
+    CouplingResult,
+    FileCoupling,
+    FileStats,
+    Hotspot,
+)
 
 SCHEMA_VERSION = 1
 SCORE_DISCLAIMER = (
@@ -27,6 +34,10 @@ SCORE_DISCLAIMER = (
 AUTHORS_DISCLAIMER = (
     "Commits and churn measure activity, not productivity or the value of "
     "anyone's work."
+)
+COUPLING_DISCLAIMER = (
+    "Files that change together are not necessarily dependent on each other; "
+    "treat strong pairs as hints worth a closer look."
 )
 
 Report = dict[str, Any]
@@ -132,6 +143,62 @@ def build_authors_report(
         summary={"authors_total": len(authors), "authors_reported": len(rows)},
         sections={"authors": rows},
     )
+
+
+def build_coupling_report(
+    result: CouplingResult, context: ReportContext, *, top: int
+) -> Report:
+    """Report for ``coupling``: ranked file pairs plus graph data.
+
+    ``graph`` describes the reported pairs as ``nodes`` (files) and ``edges``
+    (pairs), ready to be drawn by a future dashboard.
+    """
+    reported = result.pairs[:top]
+    pairs = [
+        {
+            "rank": rank,
+            "file_a": pair.file_a,
+            "file_b": pair.file_b,
+            "cochanges": pair.cochanges,
+            "commits_a": pair.commits_a,
+            "commits_b": pair.commits_b,
+            "jaccard": round(pair.jaccard, 4),
+        }
+        for rank, pair in enumerate(reported, start=1)
+    ]
+    return _build_report(
+        "coupling",
+        context,
+        summary={
+            "commits_considered": result.commits_considered,
+            "commits_skipped": result.commits_skipped,
+            "pairs_total": len(result.pairs),
+            "pairs_reported": len(pairs),
+        },
+        sections={"pairs": pairs, "graph": _coupling_graph(reported)},
+    )
+
+
+def _coupling_graph(pairs: Sequence[FileCoupling]) -> dict[str, Any]:
+    commits_per_file: dict[str, int] = {}
+    for pair in pairs:
+        commits_per_file[pair.file_a] = pair.commits_a
+        commits_per_file[pair.file_b] = pair.commits_b
+    return {
+        "nodes": [
+            {"id": path, "commits": commits}
+            for path, commits in sorted(commits_per_file.items())
+        ],
+        "edges": [
+            {
+                "source": pair.file_a,
+                "target": pair.file_b,
+                "cochanges": pair.cochanges,
+                "jaccard": round(pair.jaccard, 4),
+            }
+            for pair in pairs
+        ],
+    }
 
 
 def to_json(report: Mapping[str, Any]) -> str:
@@ -294,6 +361,14 @@ def _authors_summary(summary: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _coupling_summary(summary: Mapping[str, Any]) -> list[str]:
+    return [
+        f"**Commits considered:** {summary['commits_considered']}"
+        f" ({summary['commits_skipped']} skipped as too large)",
+        f"**Pairs:** {summary['pairs_total']} (showing {summary['pairs_reported']})",
+    ]
+
+
 def _shows_emails(report: Mapping[str, Any]) -> bool:
     return bool(report["parameters"].get("show_emails"))
 
@@ -364,5 +439,25 @@ _MARKDOWN: dict[str, _MarkdownSpec] = {
         summary_lines=_authors_summary,
         empty_message="No authors to report.",
         footer=(f"> {AUTHORS_DISCLAIMER}",),
+    ),
+    "coupling": _MarkdownSpec(
+        title="File coupling",
+        rows_key="pairs",
+        columns=[
+            _RANK,
+            _Column("File A", lambda r: r["file_a"], _LEFT),
+            _Column("File B", lambda r: r["file_b"], _LEFT),
+            _Column("Co-changes", lambda r: str(r["cochanges"])),
+            _Column("Commits A", lambda r: str(r["commits_a"])),
+            _Column("Commits B", lambda r: str(r["commits_b"])),
+            _Column("Jaccard", lambda r: f"{r['jaccard']:.2f}"),
+        ],
+        summary_lines=_coupling_summary,
+        empty_message="No file pairs reached the minimum number of co-changes.",
+        footer=(
+            "Jaccard = co-changes / commits touching either file "
+            "(1.00 = always changed together).",
+            f"> {COUPLING_DISCLAIMER}",
+        ),
     ),
 }

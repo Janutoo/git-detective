@@ -6,6 +6,11 @@ from git_detective.core.authors import (
     AuthorSort,
     compute_author_stats,
 )
+from git_detective.core.coupling import (
+    DEFAULT_MAX_FILES_PER_COMMIT,
+    DEFAULT_MIN_COCHANGES,
+    compute_coupling,
+)
 from git_detective.core.filters import (
     IGNORE_FILE_NAME,
     PathFilter,
@@ -23,6 +28,8 @@ from git_detective.core.mailmap import MAILMAP_FILE_NAME, Mailmap, read_mailmap
 
 __all__ = [
     "DEFAULT_COMMIT_LIMIT",
+    "DEFAULT_MAX_FILES_PER_COMMIT",
+    "DEFAULT_MIN_COCHANGES",
     "DEFAULT_RECENT_DAYS",
     "DEFAULT_TOP_FILES",
     "DEFAULT_WEIGHTS",
@@ -35,6 +42,7 @@ __all__ = [
     "PathFilter",
     "aggregate_file_stats",
     "compute_author_stats",
+    "compute_coupling",
     "compute_hotspots",
     "filter_commits",
     "read_ignore_file",

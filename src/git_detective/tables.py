@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from rich.markup import escape
 from rich.table import Table
 
-from git_detective.models import AuthorStats, FileStats, Hotspot
+from git_detective.models import AuthorStats, FileCoupling, FileStats, Hotspot
 
 
 def build_scan_table(stats: Sequence[FileStats]) -> Table:
@@ -96,6 +96,30 @@ def build_authors_table(
             escape(", ".join(f.path for f in author.top_files)),
         ]
         table.add_row(*row)
+    return table
+
+
+def build_coupling_table(pairs: Sequence[FileCoupling]) -> Table:
+    table = Table(
+        title="Files that change together",
+        title_justify="left",
+        caption="Co-change is a hint to investigate, not proof of a dependency.",
+        caption_justify="left",
+    )
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("File A", overflow="fold")
+    table.add_column("File B", overflow="fold")
+    table.add_column("Co-changes", justify="right", style="bold")
+    table.add_column("Jaccard", justify="right")
+
+    for rank, pair in enumerate(pairs, start=1):
+        table.add_row(
+            str(rank),
+            escape(pair.file_a),
+            escape(pair.file_b),
+            str(pair.cochanges),
+            f"{pair.jaccard:.2f}",
+        )
     return table
 
 

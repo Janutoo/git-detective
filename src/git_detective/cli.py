@@ -18,6 +18,8 @@ from rich.markup import escape
 from git_detective import __version__
 from git_detective.core import (
     DEFAULT_COMMIT_LIMIT,
+    DEFAULT_MAX_FILES_PER_COMMIT,
+    DEFAULT_MIN_COCHANGES,
     DEFAULT_RECENT_DAYS,
     DEFAULT_WEIGHTS,
     IGNORE_FILE_NAME,
@@ -28,6 +30,7 @@ from git_detective.core import (
     PathFilter,
     aggregate_file_stats,
     compute_author_stats,
+    compute_coupling,
     compute_hotspots,
     filter_commits,
     read_ignore_file,
@@ -39,6 +42,7 @@ from git_detective.reporting import (
     Report,
     ReportContext,
     build_authors_report,
+    build_coupling_report,
     build_hotspots_report,
     build_scan_report,
     to_json,
@@ -46,6 +50,7 @@ from git_detective.reporting import (
 )
 from git_detective.tables import (
     build_authors_table,
+    build_coupling_table,
     build_hotspot_table,
     build_scan_table,
 )
@@ -255,6 +260,65 @@ def authors(
     context = _report_context(analysis, parameters)
     report = build_authors_report(ranked, context, top=top, show_emails=show_emails)
     _emit(report, output_format, output)
+
+
+@app.command()
+def coupling(
+    path: Path = PATH_ARGUMENT,
+    limit: int = typer.Option(
+        DEFAULT_HISTORY_LIMIT, "--limit", "-l", min=1, help="Max commits to analyze."
+    ),
+    top: int = typer.Option(
+        20, "--top", "-t", min=1, help="Number of file pairs to display."
+    ),
+    min_cochanges: int = typer.Option(
+        DEFAULT_MIN_COCHANGES,
+        "--min-cochanges",
+        min=1,
+        help="Ignore pairs changed together fewer times than this.",
+    ),
+    max_files_per_commit: int = typer.Option(
+        DEFAULT_MAX_FILES_PER_COMMIT,
+        "--max-files-per-commit",
+        min=2,
+        help="Skip commits that change more files than this (bulk changes).",
+    ),
+    exclude: list[str] | None = EXCLUDE_OPTION,
+    output_format: OutputFormat = FORMAT_OPTION,
+    output: Path | None = OUTPUT_OPTION,
+) -> None:
+    """Find pairs of files that frequently change in the same commits."""
+    _check_output_option(output_format, output)
+    analysis = _prepare(path, limit, exclude)
+    result = compute_coupling(
+        analysis.commits,
+        min_cochanges=min_cochanges,
+        max_files_per_commit=max_files_per_commit,
+    )
+
+    if output_format is OutputFormat.TABLE:
+        if not analysis.commits:
+            console.print(
+                f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
+            )
+            return
+        _print_header(analysis, f"[bold]{len(result.pairs)}[/] coupled pairs")
+        console.print(
+            f"Considered {result.commits_considered} commits; skipped "
+            f"{result.commits_skipped} with more than {max_files_per_commit} files. "
+            f"Minimum co-changes: {min_cochanges}."
+        )
+        console.print(build_coupling_table(result.pairs[:top]))
+        return
+
+    parameters = {
+        "limit": limit,
+        "top": top,
+        "min_cochanges": min_cochanges,
+        "max_files_per_commit": max_files_per_commit,
+    }
+    context = _report_context(analysis, parameters)
+    _emit(build_coupling_report(result, context, top=top), output_format, output)
 
 
 def _utc_now() -> datetime:
