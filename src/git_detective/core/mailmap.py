@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
+from git_detective.core.safe_files import read_repo_text
 from git_detective.exceptions import MailmapError
 
 MAILMAP_FILE_NAME = ".mailmap"
@@ -97,9 +98,12 @@ class Mailmap:
 
 
 def read_mailmap(path: Path) -> Mailmap:
-    """Load a ``.mailmap`` file; a missing file yields an empty mailmap."""
+    """Load a ``.mailmap`` file; a missing file yields an empty mailmap.
+
+    Symlinks and other non-regular files are refused.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_repo_text(path)
     except FileNotFoundError:
         return Mailmap()
     except (OSError, UnicodeDecodeError) as exc:

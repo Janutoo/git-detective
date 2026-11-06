@@ -1,0 +1,17 @@
+# Configuration of the Git Detective API server.
+# Copy to git-detective-api.toml (ignored by Git) and adjust:
+#
+#     git-detective serve --config git-detective-api.toml
+
+# Where to keep the analysis history. Default: $XDG_DATA_HOME/git-detective/analyses.db
+# or ~/.local/share/git-detective/analyses.db when XDG_DATA_HOME is not set.
+# database = "~/.local/share/git-detective/analyses.db"
+
+# How many analyses may run at once; further requests get HTTP 429.
+# max_concurrent_analyses = 2
+
+# The allowlist: the API can read only these repositories, and clients refer to
+# them by id. An id uses lowercase letters, digits, ".", "_" and "-".
+# Each path must be absolute (or start with ~) and contain a real .git directory.
+[repositories]
+my-project = "~/code/my-project"

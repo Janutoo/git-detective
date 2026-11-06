@@ -2,8 +2,10 @@
 
 Safety note: the reader only inspects Git *objects* (``rev-list`` via GitPython
 and the ``diff-tree`` plumbing command). It never checks out files, runs
-``git status``, or invokes hooks, so no code from the analyzed repository is
-executed. External diff drivers and textconv filters are explicitly disabled.
+``git status``, or invokes hooks. The repository's own ``.git/config`` is
+untrusted, so everything in it that could run a command on these code paths is
+turned off: external diff drivers, textconv filters and the file system monitor
+(``core.fsmonitor``, which ``diff-tree`` would otherwise start).
 """
 
 from pathlib import Path
@@ -41,25 +43,49 @@ class GitReader:
             commits = reader.read_commits(limit=50)
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, allow_lazy_fetch: bool = True) -> None:
+        """Open the repository containing ``path``.
+
+        Args:
+            path: The repository or any directory inside it.
+            allow_lazy_fetch: In a partial clone, Git downloads missing objects
+                on demand, using the transport set in the repository's config.
+                Disable this where reading a repository must never reach the
+                network or run a configured command; reading then fails instead.
+        """
         try:
             self._repo = Repo(path, search_parent_directories=True)
         except NoSuchPathError as exc:
             raise InvalidRepositoryError(f"Path does not exist: {path}") from exc
         except InvalidGitRepositoryError as exc:
             raise InvalidRepositoryError(f"Not a Git repository: {path}") from exc
+        # Command-line configuration takes precedence over the repository's.
+        self._repo.git.set_persistent_git_options(c="core.fsmonitor=false")
+        if not allow_lazy_fetch:
+            self._repo.git.update_environment(GIT_NO_LAZY_FETCH="1")
 
     @property
     def root(self) -> Path:
         """Top-level directory of the repository (or the git dir if bare)."""
         return Path(self._repo.working_tree_dir or self._repo.git_dir)
 
-    def read_commits(self, limit: int = DEFAULT_COMMIT_LIMIT) -> list[CommitInfo]:
-        """Return up to ``limit`` most recent commits reachable from HEAD.
+    @property
+    def head_sha(self) -> str | None:
+        """Full hash of the HEAD commit, or None if there are no commits yet."""
+        head = self._repo.head
+        return head.commit.hexsha if head.is_valid() else None
+
+    def read_commits(
+        self, limit: int = DEFAULT_COMMIT_LIMIT, *, rev: str = "HEAD"
+    ) -> list[CommitInfo]:
+        """Return up to ``limit`` most recent commits reachable from ``rev``.
 
         Commits are ordered from newest to oldest. Merge commits are skipped:
         their changes already appear in the commits being merged, so counting
         them again would inflate churn.
+
+        ``rev`` is passed to Git as a revision, so it must come from trusted
+        code, never directly from user input.
 
         Raises:
             ValueError: If ``limit`` is smaller than 1.
@@ -77,7 +103,7 @@ class GitReader:
             return [
                 self._to_commit_info(commit)
                 for commit in self._repo.iter_commits(
-                    "HEAD", max_count=limit, no_merges=True
+                    rev, max_count=limit, no_merges=True
                 )
             ]
         except GitCommandError as exc:

@@ -26,7 +26,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+api = [
+    # 0.132 enables strict_content_type by default, which protects a local,
+    # unauthenticated API against cross-site requests without a JSON header.
+    "fastapi>=0.132",
+    "uvicorn>=0.30",
+]
 dev = [
+    "git-detective[api]",
+    "httpx2>=2.0",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

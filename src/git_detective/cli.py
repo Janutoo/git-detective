@@ -5,11 +5,12 @@ renders results with Rich (tables) or the reporting module (JSON/Markdown).
 It contains no Git or analysis logic of its own.
 """
 
-from dataclasses import asdict, dataclass
+import ipaddress
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import NoReturn
 
 import typer
 from rich.console import Console
@@ -21,32 +22,25 @@ from git_detective.core import (
     DEFAULT_MAX_FILES_PER_COMMIT,
     DEFAULT_MIN_COCHANGES,
     DEFAULT_RECENT_DAYS,
-    DEFAULT_WEIGHTS,
     IGNORE_FILE_NAME,
     MAILMAP_FILE_NAME,
     AuthorSort,
-    GitReader,
-    Mailmap,
-    PathFilter,
-    aggregate_file_stats,
-    compute_author_stats,
-    compute_coupling,
-    compute_hotspots,
-    filter_commits,
-    read_ignore_file,
-    read_mailmap,
 )
 from git_detective.exceptions import GitDetectiveError
-from git_detective.models import CommitInfo
-from git_detective.reporting import (
-    Report,
-    ReportContext,
-    build_authors_report,
-    build_coupling_report,
-    build_hotspots_report,
-    build_scan_report,
-    to_json,
-    to_markdown,
+from git_detective.reporting import Report, to_json, to_markdown
+from git_detective.service import (
+    DEFAULT_COUPLING_TOP,
+    DEFAULT_HISTORY_LIMIT,
+    DEFAULT_TOP,
+    AnalysisResult,
+    AuthorsConfig,
+    CouplingConfig,
+    HotspotsConfig,
+    ScanConfig,
+    run_authors,
+    run_coupling,
+    run_hotspots,
+    run_scan,
 )
 from git_detective.tables import (
     build_authors_table,
@@ -55,9 +49,8 @@ from git_detective.tables import (
     build_scan_table,
 )
 
-DEFAULT_TOP = 10
-# History-oriented analyses (authors, coupling) need a longer window by default.
-DEFAULT_HISTORY_LIMIT = 500
+LOCAL_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
 
 
 class OutputFormat(StrEnum):
@@ -103,16 +96,6 @@ console = Console()
 error_console = Console(stderr=True)
 
 
-@dataclass(frozen=True, slots=True)
-class _Analysis:
-    """Commits ready for analysis, after applying exclude patterns."""
-
-    root: Path
-    commits: list[CommitInfo]
-    path_filter: PathFilter
-    ignore_file_used: bool
-
-
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"git-detective {__version__}")
@@ -143,21 +126,17 @@ def scan(
 ) -> None:
     """Show the most frequently changed files in recent history."""
     _check_output_option(output_format, output)
-    analysis = _prepare(path, limit, exclude)
-    stats = aggregate_file_stats(analysis.commits)
+    config = ScanConfig(limit=limit, top=top, exclude=tuple(exclude or ()))
+    result = _run(run_scan, path, config, _utc_now())
 
     if output_format is OutputFormat.TABLE:
-        if not analysis.commits:
-            console.print(
-                f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
-            )
+        if _report_no_commits(result):
             return
-        _print_header(analysis, f"[bold]{len(stats)}[/] files changed")
-        console.print(build_scan_table(stats[:top]))
+        _print_header(result, f"[bold]{len(result.data)}[/] files changed")
+        console.print(build_scan_table(result.data[:top]))
         return
 
-    context = _report_context(analysis, {"limit": limit, "top": top})
-    _emit(build_scan_report(stats, context, top=top), output_format, output)
+    _emit(result.report, output_format, output)
 
 
 @app.command()
@@ -178,33 +157,22 @@ def hotspots(
 ) -> None:
     """Rank files by Hotspot Score (frequency, churn and recent activity)."""
     _check_output_option(output_format, output)
-    analysis = _prepare(path, limit, exclude)
     now = _utc_now()
-    ranked = compute_hotspots(
-        analysis.commits, reference_time=now, recent_days=recent_days
+    config = HotspotsConfig(
+        limit=limit, top=top, exclude=tuple(exclude or ()), recent_days=recent_days
     )
+    result = _run(run_hotspots, path, config, now)
 
     if output_format is OutputFormat.TABLE:
-        if not analysis.commits:
-            console.print(
-                f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
-            )
+        if _report_no_commits(result):
             return
         since = (now - timedelta(days=recent_days)).date().isoformat()
-        _print_header(analysis, f"[bold]{len(ranked)}[/] files changed")
+        _print_header(result, f"[bold]{len(result.data)}[/] files changed")
         console.print(f"Recent window: last {recent_days} days (since {since})")
-        console.print(build_hotspot_table(ranked[:top]))
+        console.print(build_hotspot_table(result.data[:top]))
         return
 
-    parameters = {
-        "limit": limit,
-        "top": top,
-        "recent_days": recent_days,
-        "reference_time": now,
-        "weights": asdict(DEFAULT_WEIGHTS),
-    }
-    context = _report_context(analysis, parameters, generated_at=now)
-    _emit(build_hotspots_report(ranked, context, top=top), output_format, output)
+    _emit(result.report, output_format, output)
 
 
 @app.command()
@@ -234,32 +202,25 @@ def authors(
 ) -> None:
     """Show contributor activity: commits, churn, files and active period."""
     _check_output_option(output_format, output)
-    analysis = _prepare(path, limit, exclude)
-    mailmap = _load_mailmap(analysis.root)
-    ranked = compute_author_stats(analysis.commits, mailmap=mailmap, sort_by=sort)
+    config = AuthorsConfig(
+        limit=limit,
+        top=top,
+        exclude=tuple(exclude or ()),
+        sort=sort,
+        show_emails=show_emails,
+    )
+    result = _run(run_authors, path, config, _utc_now())
 
     if output_format is OutputFormat.TABLE:
-        if not analysis.commits:
-            console.print(
-                f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
-            )
+        if _report_no_commits(result):
             return
-        _print_header(analysis, f"[bold]{len(ranked)}[/] authors")
-        if mailmap:
+        _print_header(result, f"[bold]{len(result.data)}[/] authors")
+        if result.mailmap_used:
             console.print(f"[dim]Aliases resolved with {MAILMAP_FILE_NAME}[/]")
-        console.print(build_authors_table(ranked[:top], show_emails=show_emails))
+        console.print(build_authors_table(result.data[:top], show_emails=show_emails))
         return
 
-    parameters = {
-        "limit": limit,
-        "top": top,
-        "sort": sort,
-        "show_emails": show_emails,
-        "mailmap": MAILMAP_FILE_NAME if mailmap else None,
-    }
-    context = _report_context(analysis, parameters)
-    report = build_authors_report(ranked, context, top=top, show_emails=show_emails)
-    _emit(report, output_format, output)
+    _emit(result.report, output_format, output)
 
 
 @app.command()
@@ -269,7 +230,11 @@ def coupling(
         DEFAULT_HISTORY_LIMIT, "--limit", "-l", min=1, help="Max commits to analyze."
     ),
     top: int = typer.Option(
-        20, "--top", "-t", min=1, help="Number of file pairs to display."
+        DEFAULT_COUPLING_TOP,
+        "--top",
+        "-t",
+        min=1,
+        help="Number of file pairs to display.",
     ),
     min_cochanges: int = typer.Option(
         DEFAULT_MIN_COCHANGES,
@@ -289,36 +254,111 @@ def coupling(
 ) -> None:
     """Find pairs of files that frequently change in the same commits."""
     _check_output_option(output_format, output)
-    analysis = _prepare(path, limit, exclude)
-    result = compute_coupling(
-        analysis.commits,
+    config = CouplingConfig(
+        limit=limit,
+        top=top,
+        exclude=tuple(exclude or ()),
         min_cochanges=min_cochanges,
         max_files_per_commit=max_files_per_commit,
     )
+    result = _run(run_coupling, path, config, _utc_now())
 
     if output_format is OutputFormat.TABLE:
-        if not analysis.commits:
-            console.print(
-                f"[yellow]No commits found in[/] {escape(str(analysis.root))}"
-            )
+        if _report_no_commits(result):
             return
-        _print_header(analysis, f"[bold]{len(result.pairs)}[/] coupled pairs")
+        pairs = result.data
+        _print_header(result, f"[bold]{len(pairs.pairs)}[/] coupled pairs")
         console.print(
-            f"Considered {result.commits_considered} commits; skipped "
-            f"{result.commits_skipped} with more than {max_files_per_commit} files. "
+            f"Considered {pairs.commits_considered} commits; skipped "
+            f"{pairs.commits_skipped} with more than {max_files_per_commit} files. "
             f"Minimum co-changes: {min_cochanges}."
         )
-        console.print(build_coupling_table(result.pairs[:top]))
+        console.print(build_coupling_table(pairs.pairs[:top]))
         return
 
-    parameters = {
-        "limit": limit,
-        "top": top,
-        "min_cochanges": min_cochanges,
-        "max_files_per_commit": max_files_per_commit,
-    }
-    context = _report_context(analysis, parameters)
-    _emit(build_coupling_report(result, context, top=top), output_format, output)
+    _emit(result.report, output_format, output)
+
+
+@app.command()
+def serve(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        envvar="GIT_DETECTIVE_CONFIG",
+        help="TOML file listing the repositories the API may read.",
+    ),
+    host: str = typer.Option(LOCAL_HOST, "--host", help="Address to listen on."),
+    port: int = typer.Option(
+        DEFAULT_PORT, "--port", "-p", min=1, max=65535, help="Port to listen on."
+    ),
+    allow_remote: bool = typer.Option(
+        False,
+        "--allow-remote",
+        help="Allow listening on a non-loopback address. "
+        "The API has no authentication: anyone who can reach it can use it.",
+    ),
+) -> None:
+    """Start the REST API server (requires the "api" extra)."""
+    try:
+        _check_bind_address(host, allow_remote=allow_remote)
+    except ValueError as exc:
+        _fail(exc)
+
+    try:
+        import uvicorn
+
+        from git_detective.api.app import LOOPBACK_HOSTS, create_app
+        from git_detective.api.config import load_settings
+    except ImportError:
+        _fail(
+            "The API server needs extra dependencies. "
+            'Install them with: pip install "git-detective[api]"'
+        )
+
+    if allow_remote:
+        error_console.print(
+            f"[bold yellow]Warning:[/] listening on {escape(host)} without "
+            "authentication. Anyone who can reach this address can use the API."
+        )
+    try:
+        application = create_app(
+            load_settings(config),
+            allowed_hosts=sorted({*LOOPBACK_HOSTS, host}),
+        )
+    except GitDetectiveError as exc:
+        _fail(exc)
+    uvicorn.run(application, host=host, port=port)
+
+
+def _check_bind_address(host: str, *, allow_remote: bool) -> None:
+    """Refuse addresses that would expose the API without an explicit request.
+
+    Raises:
+        ValueError: If the server must not listen on ``host``.
+    """
+    if host == "localhost":
+        return
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # A host name, which could resolve to anything.
+        address = None
+
+    if address is None and not host.strip():
+        raise ValueError("--host must not be empty")
+    if address is not None and address.version == 6:
+        raise ValueError("IPv6 addresses are not supported; use an IPv4 address")
+    if address is not None and address.is_unspecified:
+        raise ValueError(
+            f"Refusing to listen on all network interfaces ({host}); "
+            "name one specific address"
+        )
+    if (address is None or not address.is_loopback) and not allow_remote:
+        raise ValueError(
+            f"{host} is not a loopback address and the API has no authentication; "
+            "pass --allow-remote if this is really what you want"
+        )
 
 
 def _utc_now() -> datetime:
@@ -339,55 +379,21 @@ def _check_output_option(output_format: OutputFormat, output: Path | None) -> No
         )
 
 
-def _load_commits(path: Path, limit: int) -> tuple[list[CommitInfo], Path]:
-    """Read commits for a CLI command, turning known errors into exit code 1."""
+def _run[C, T](
+    run: Callable[..., AnalysisResult[T]], path: Path, config: C, now: datetime
+) -> AnalysisResult[T]:
+    """Run an analysis, turning known errors into exit code 1."""
     try:
-        with GitReader(path) as reader:
-            return reader.read_commits(limit=limit), reader.root
+        return run(path, config, now=now)
     except GitDetectiveError as exc:
         _fail(exc)
 
 
-def _prepare(path: Path, limit: int, exclude: list[str] | None) -> _Analysis:
-    """Load commits and drop files matched by the ignore file or --exclude."""
-    commits, root = _load_commits(path, limit)
-    ignore_file = root / IGNORE_FILE_NAME
-    try:
-        file_patterns = read_ignore_file(ignore_file)
-        path_filter = PathFilter([*file_patterns, *(exclude or [])])
-    except GitDetectiveError as exc:
-        _fail(exc)
-    return _Analysis(
-        root=root,
-        commits=filter_commits(commits, path_filter),
-        path_filter=path_filter,
-        ignore_file_used=bool(file_patterns),
-    )
-
-
-def _load_mailmap(root: Path) -> Mailmap:
-    try:
-        return read_mailmap(root / MAILMAP_FILE_NAME)
-    except GitDetectiveError as exc:
-        _fail(exc)
-
-
-def _report_context(
-    analysis: _Analysis,
-    parameters: dict[str, Any],
-    *,
-    generated_at: datetime | None = None,
-) -> ReportContext:
-    return ReportContext(
-        repository=analysis.root,
-        generated_at=generated_at or _utc_now(),
-        commits=analysis.commits,
-        parameters={
-            **parameters,
-            "exclude": list(analysis.path_filter.patterns),
-            "ignore_file": IGNORE_FILE_NAME if analysis.ignore_file_used else None,
-        },
-    )
+def _report_no_commits(result: AnalysisResult) -> bool:
+    if result.commits_analyzed:
+        return False
+    console.print(f"[yellow]No commits found in[/] {escape(str(result.root))}")
+    return True
 
 
 def _emit(report: Report, output_format: OutputFormat, output: Path | None) -> None:
@@ -409,12 +415,12 @@ def _emit(report: Report, output_format: OutputFormat, output: Path | None) -> N
     error_console.print(f"Report written to {escape(str(output))}")
 
 
-def _print_header(analysis: _Analysis, detail: str) -> None:
+def _print_header(result: AnalysisResult, detail: str) -> None:
     """Print "Analyzed N commits in <repo> (<detail>)" and active exclusions."""
     console.print(
-        f"Analyzed [bold cyan]{len(analysis.commits)}[/] commits in "
-        f"[bold]{escape(str(analysis.root))}[/] ({detail})"
+        f"Analyzed [bold cyan]{result.commits_analyzed}[/] commits in "
+        f"[bold]{escape(str(result.root))}[/] ({detail})"
     )
-    if analysis.path_filter:
-        patterns = ", ".join(analysis.path_filter.patterns)
+    if result.exclude_patterns:
+        patterns = ", ".join(result.exclude_patterns)
         console.print(f"[dim]Excluding: {escape(patterns)}[/]")

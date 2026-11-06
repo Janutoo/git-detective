@@ -9,7 +9,12 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from git import Actor, Repo
+
+from git_detective.api.app import create_app
+from git_detective.api.config import ApiSettings
 
 # CLI tests compare plain text. Rich reads these variables when the CLI's
 # consoles are created (at import time), so drop them before any test module
@@ -22,6 +27,21 @@ BASE_TIMESTAMP = 1_704_110_400  # 2024-01-01 12:00:00 UTC
 
 # Maps a relative file path to its new content (str/bytes) or None to delete it.
 FileSpec = dict[str, str | bytes | None]
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Point the user's home at a throwaway directory for every test.
+
+    The default database lives under the home directory, so no test can reach
+    a real database, even by accident.
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    return home
 
 
 @pytest.fixture
@@ -76,3 +96,38 @@ def make_commit(repo: Repo) -> Callable[..., str]:
         return commit.hexsha
 
     return _commit
+
+
+@pytest.fixture
+def repo_path(repo: Repo) -> Path:
+    return Path(repo.working_tree_dir)
+
+
+@pytest.fixture
+def seeded_repo(make_commit: Callable[..., str]) -> str:
+    """Two authors and a file pair changed together 3 times. Returns the HEAD SHA."""
+    bob = Actor("Bob Builder", "bob@secret.example.com")
+    make_commit({"src/a.py": "1\n", "src/b.py": "1\n"})
+    make_commit({"src/a.py": "1\n2\n", "src/b.py": "1\n2\n"}, author=bob)
+    return make_commit({"src/a.py": "3\n", "src/b.py": "3\n", "c.lock": "x\n"})
+
+
+@pytest.fixture
+def database_path(tmp_path: Path) -> Path:
+    return tmp_path / "data" / "analyses.db"
+
+
+@pytest.fixture
+def api_settings(repo_path: Path, database_path: Path) -> ApiSettings:
+    return ApiSettings(repositories={"demo": repo_path}, database=database_path)
+
+
+@pytest.fixture
+def api_app(api_settings: ApiSettings) -> FastAPI:
+    return create_app(api_settings)
+
+
+@pytest.fixture
+def client(api_app: FastAPI) -> Iterator[TestClient]:
+    with TestClient(api_app, base_url="http://127.0.0.1") as test_client:
+        yield test_client

@@ -23,3 +23,11 @@ class IgnorePatternError(GitDetectiveError):
 
 class MailmapError(GitDetectiveError):
     """The ``.mailmap`` file cannot be read."""
+
+
+class StorageError(GitDetectiveError):
+    """The analysis history database cannot be read or written."""
+
+
+class ApiConfigError(GitDetectiveError):
+    """The API configuration file is missing or invalid."""

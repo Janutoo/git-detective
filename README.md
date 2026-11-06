@@ -6,11 +6,12 @@ Git Detective analyzes the history of a local Git repository to show where
 the code changes most often. It is the starting point for finding code
 hotspots and understanding contributor activity.
 
-> **Status:** early development (stage 4). `scan` lists the most frequently
+> **Status:** early development (stage 5). `scan` lists the most frequently
 > changed files, `hotspots` ranks files by a Hotspot Score, `authors`
 > summarizes contributor activity and `coupling` finds files that change
 > together. Every command can exclude files and export JSON or Markdown
-> reports.
+> reports. A local [REST API](#rest-api) runs the same analyses and keeps a
+> history of their reports.
 
 ## Features
 
@@ -24,6 +25,8 @@ hotspots and understanding contributor activity.
 - Detects file coupling: pairs of files that change in the same commits.
 - Excludes files with `.gitignore`-style patterns.
 - Exports reports as JSON or Markdown.
+- Offers a local REST API that stores every report in SQLite, so old reports
+  can be read without analyzing the repository again.
 - Read-only: Git Detective never checks out files, runs hooks, or executes
   code from the analyzed repository.
 
@@ -274,6 +277,10 @@ vendor/
 Patterns from `.gitdetectiveignore` are applied first, then `--exclude`, so
 `--exclude "!poetry.lock"` can bring back a file the ignore file hides.
 
+`.gitdetectiveignore` and `.mailmap` must be regular files of at most 1 MiB.
+A symlink is refused with an error, because its target could be a private file
+whose contents would end up in a report.
+
 Filtering happens **before** metrics are aggregated and normalized, so
 excluding a huge lockfile changes the scores of the remaining files.
 Excluded files are dropped, but commits are kept, so `--limit` still means
@@ -431,16 +438,188 @@ A heading, a list of run metadata and a GitHub-flavored table:
 File names and other values are escaped, so characters such as `|`, `_`,
 `*`, `<` or `[` cannot break the table or inject formatting, links or HTML.
 
+## REST API
+
+The API runs the same analyses as the CLI and stores every report, so past
+results stay available even after the repository changes or disappears. It is
+meant for your own machine: **it has no authentication** and listens on
+`127.0.0.1` by default.
+
+### Running the server
+
+```bash
+pip install -e ".[api]"     # or ".[dev]", which includes it
+```
+
+List the repositories the API may read in a configuration file (start from
+[`git-detective-api.example.toml`](git-detective-api.example.toml)):
+
+```toml
+# git-detective-api.toml
+[repositories]
+my-project = "~/code/my-project"
+```
+
+```bash
+git-detective serve --config git-detective-api.toml
+```
+
+Swagger UI is then available at <http://127.0.0.1:8000/docs>, and the OpenAPI
+schema at `/openapi.json`. The `/docs` page loads its scripts from a CDN, so it
+needs internet access; the API itself does not.
+
+### Example requests
+
+```bash
+API=http://127.0.0.1:8000/api/v1
+
+curl "$API/health"
+curl "$API/repositories"
+
+# Run an analysis and keep its id. The report is complete when this returns.
+curl -X POST "$API/analyses" -H "Content-Type: application/json" -d '{
+  "repository": "my-project",
+  "type": "hotspots",
+  "parameters": {"limit": 500, "top": 20, "recent_days": 90, "exclude": ["*.lock"]}
+}'
+
+curl -X POST "$API/analyses" -H "Content-Type: application/json" \
+  -d '{"repository": "my-project", "type": "coupling",
+       "parameters": {"min_cochanges": 5, "max_files_per_commit": 30}}'
+
+# Browse the history, newest first
+curl "$API/analyses?repository=my-project&type=hotspots&limit=10&offset=0"
+
+# Read a stored report; Git is not involved
+curl "$API/analyses/$ID"
+curl "$API/analyses/$ID/hotspots"
+
+curl -X DELETE "$API/analyses/$ID"
+```
+
+### Endpoints
+
+| Endpoint                          | Result                                       |
+| --------------------------------- | -------------------------------------------- |
+| `GET /api/v1/health`              | Server and database status                   |
+| `GET /api/v1/repositories`        | Allowed repository ids and their availability |
+| `POST /api/v1/analyses`           | `201`: runs an analysis and stores the report |
+| `GET /api/v1/analyses`            | Stored analyses, without reports             |
+| `GET /api/v1/analyses/{id}`       | One analysis with its full report            |
+| `GET /api/v1/analyses/{id}/hotspots` | Ranked files of a `hotspots` analysis     |
+| `GET /api/v1/analyses/{id}/authors`  | Contributors of an `authors` analysis     |
+| `GET /api/v1/analyses/{id}/coupling` | Pairs and graph of a `coupling` analysis  |
+| `DELETE /api/v1/analyses/{id}`    | `204`: deletes the stored analysis           |
+
+Parameters of `POST /api/v1/analyses` (all optional, unknown fields are rejected):
+
+| Parameter              | Analyses | Default                    | Range                  |
+| ---------------------- | -------- | -------------------------- | ---------------------- |
+| `limit`                | all      | 100 (hotspots), 500 (others) | 1-5000               |
+| `top`                  | all      | 10, 20 (coupling)          | 1-1000                 |
+| `exclude`              | all      | none                       | up to 100 patterns of up to 256 characters |
+| `recent_days`          | hotspots | 30                         | 1-3650                 |
+| `sort`                 | authors  | `commits`                  | `commits`, `churn`     |
+| `min_cochanges`        | coupling | 3                          | 1-10000                |
+| `max_files_per_commit` | coupling | 50                         | 2-200                  |
+
+Every error has the same shape:
+
+```json
+{"error": {"code": "analysis_not_found", "message": "There is no analysis with this id.", "details": []}}
+```
+
+| Status | `code`                    | Meaning                                         |
+| ------ | ------------------------- | ----------------------------------------------- |
+| 400    | (plain text)              | The `Host` header is not an allowed host        |
+| 404    | `repository_not_found`    | The repository id is not on the allowlist       |
+| 404    | `analysis_not_found`, `not_found` | No such analysis or route               |
+| 405    | `method_not_allowed`      | The route does not support this method          |
+| 409    | `repository_unavailable`  | The repository cannot be read (details in the server log) |
+| 409    | `analysis_type_mismatch`  | For example `/hotspots` of a `coupling` analysis |
+| 422    | `validation_error`        | Invalid request; `details` lists each problem   |
+| 422    | `analysis_too_large`      | The report exceeds 5 MiB; lower `top` or `limit` |
+| 429    | `analysis_busy`           | All analysis slots are in use; see `Retry-After` |
+| 500    | `internal_error`          | Unexpected failure                              |
+| 503    | `storage_unavailable`     | The database cannot be used                     |
+
+### Long-running requests
+
+An analysis runs **inside the `POST` request**; there is no job queue. Reading
+history starts one Git process per commit, about 12 ms each on a small
+repository, so 5000 commits take on the order of a minute or more. Give your
+HTTP client a long enough timeout. Other requests are still served meanwhile.
+
+At most `max_concurrent_analyses` (default 2) run at once, and further requests
+get `429` right away. Disconnecting does not stop a running analysis.
+
+### Report storage
+
+Reports are kept in a SQLite database, by default in
+`$XDG_DATA_HOME/git-detective/analyses.db` (`~/.local/share/git-detective/analyses.db`
+if the variable is not set); change this with `database` in the configuration
+file. The file is readable only by its owner.
+
+Each row holds the analysis id (UUID), repository id, analysis type, parameters,
+execution time, the HEAD hash at that moment, the number of analyzed commits and
+the report as JSON. The hash is read once and the analysis walks from it, so it
+always describes the stored report, even if someone commits in the meantime.
+The schema version is kept in `PRAGMA user_version`, and migrations run
+automatically at startup. A database created by a newer version is refused.
+
+### Security
+
+- **Allowlist only.** Requests name a repository id from the configuration file.
+  The API never accepts a path, and has no endpoint that runs commands.
+- **Paths are checked on every request.** A repository's real location is pinned
+  at startup; if a symlink or directory later resolves elsewhere, the repository
+  becomes unavailable. A real `.git` directory is required, so **worktrees,
+  submodules and bare repositories are not supported** by the API.
+- **Repository contents are untrusted.** Hooks, external diff drivers, textconv
+  filters and `core.fsmonitor` never run, and neither does a partial clone's
+  download of missing objects (such a repository gets `409`). `.gitdetectiveignore`
+  and `.mailmap` must be regular files of at most 1 MiB.
+- **No e-mail addresses.** The API cannot return them, even on request, so they
+  are never stored either. Use `git-detective authors --show-emails` locally.
+  Author names are stored as written in commits, and a few people use an e-mail
+  address as their name.
+- **No absolute paths.** Reports name the repository by id, and error messages
+  are fixed texts; details go only to the server log.
+- **Local by default.** `serve` refuses a non-loopback address without
+  `--allow-remote`, and always refuses `0.0.0.0` and IPv6. Requests are accepted
+  only with a `Host` header naming a loopback host or the `--host` address, which
+  stops DNS rebinding. No CORS headers are sent, so web pages cannot read
+  responses or send `DELETE`, and a `POST` needs a JSON content type.
+
+Known limitations:
+
+- Any process on your machine can use the API, including deleting reports.
+- There is no time limit on an analysis. The commit limit bounds it, but a
+  repository with enormous commits can still take long and use a lot of memory.
+- Blocking partial clone downloads relies on `GIT_NO_LAZY_FETCH`, which older
+  Git versions ignore. Keep Git up to date if you allowlist partial clones.
+
 ## Project structure
 
 ```
 src/git_detective/
-├── cli.py              # Typer commands and orchestration (presentation layer)
+├── cli.py              # Typer commands (presentation layer)
 ├── tables.py           # Rich tables for terminal output
+├── service.py          # Runs analyses; shared by the CLI and the API
 ├── reporting.py        # JSON / Markdown reports (no Git or CLI code)
+├── storage.py          # SQLite analysis history (no FastAPI code)
 ├── exceptions.py       # Project-specific errors
+├── api/                # REST API (needs the "api" extra)
+│   ├── app.py          # Application factory and middleware
+│   ├── config.py       # TOML configuration
+│   ├── registry.py     # Repository allowlist, path and symlink checks
+│   ├── runner.py       # Runs one analysis within limits and stores it
+│   ├── routes.py       # Endpoints
+│   ├── schemas.py      # Request and response models, limits
+│   └── errors.py       # One error format for every failure
 ├── core/
 │   ├── git_reader.py   # Reads commits and per-file line changes from Git
+│   ├── safe_files.py   # Safe reading of files stored in a repository
 │   ├── filters.py      # --exclude / .gitdetectiveignore path filtering
 │   ├── analyzer.py     # Aggregates commits into per-file statistics
 │   ├── hotspots.py     # Hotspot Score: normalization, weights, ranking
@@ -465,8 +644,8 @@ ruff format .           # format (Python files and Python blocks in Markdown)
 ruff format --check .   # verify formatting without changing files
 ```
 
-Tests create temporary Git repositories, so they never depend on your own
-repositories or global Git configuration.
+Tests create temporary Git repositories and databases, and run with a temporary
+home directory, so they never touch your own repositories or analysis history.
 
 ### Continuous integration
 
@@ -485,3 +664,4 @@ commands from the list above.
 
 - Time filters such as `--since` / `--until`
 - Combining hotspots with code complexity
+- Background workers for long analyses in the API

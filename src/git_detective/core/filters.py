@@ -22,6 +22,7 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
+from git_detective.core.safe_files import read_repo_text
 from git_detective.exceptions import IgnorePatternError
 from git_detective.models import CommitInfo
 
@@ -53,10 +54,11 @@ def read_ignore_file(path: Path) -> list[str]:
     """Read patterns from an ignore file; a missing file yields no patterns.
 
     Blank lines and ``#`` comments are dropped so the result lists only real
-    patterns (use ``\\#`` for a pattern that starts with ``#``).
+    patterns (use ``\\#`` for a pattern that starts with ``#``). The patterns
+    end up in reports, so symlinks and other non-regular files are refused.
     """
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = read_repo_text(path).splitlines()
     except FileNotFoundError:
         return []
     except (OSError, UnicodeDecodeError) as exc:

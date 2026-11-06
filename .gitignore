@@ -17,6 +17,11 @@ build/
 .coverage
 htmlcov/
 
+# Local API configuration and data
+git-detective-api.toml
+*.db
+*.db-journal
+
 # OS / editors
 .DS_Store
 .idea/
